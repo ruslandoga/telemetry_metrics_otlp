@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    env:
+      MIX_ENV: test
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: beam
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ">0"
+          otp-version: ">0"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: test-${{ steps.beam.outputs.elixir-version }}-${{ github.head_ref || github.ref }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            test-${{ steps.beam.outputs.elixir-version }}-${{ github.head_ref || github.ref }}-
+            test-${{ steps.beam.outputs.elixir-version }}-refs/heads/master-
+
+      - run: mix deps.get --check-locked
+      - run: mix deps.unlock --check-unused
+      - run: mix hex.audit
+      - run: mix format --check-formatted
+      - run: mix compile --warnings-as-errors
+      - run: mix test
