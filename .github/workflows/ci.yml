@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [master]
+  schedule:
+    - cron: "42 9 * * *"
   workflow_dispatch:
 
 permissions:
@@ -16,6 +18,13 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    services:
+      collector:
+        image: otel/opentelemetry-collector:latest
+        ports:
+          - 4317:4317
+          - 4318:4318
 
     env:
       MIX_ENV: test
