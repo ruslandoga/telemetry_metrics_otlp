@@ -5,8 +5,8 @@ defmodule TelemetryMetricsOTLP.DefinitionTest do
 
   alias TelemetryMetricsOTLP.Definition
 
-  describe "compile!/2" do
-    test "assigns the id and maps every supported metric kind" do
+  describe "compile!/1" do
+    test "assigns a semantic key and maps every supported metric kind" do
       metrics = [
         {counter("http.requests.count"), :counter},
         {sum("http.requests.bytes"), :sum},
@@ -14,10 +14,10 @@ defmodule TelemetryMetricsOTLP.DefinitionTest do
         {distribution("http.requests.duration"), :histogram}
       ]
 
-      for {{metric, expected_kind}, id} <- Enum.with_index(metrics) do
-        definition = Definition.compile!(metric, id)
+      for {metric, expected_kind} <- metrics do
+        definition = Definition.compile!(metric)
 
-        assert definition.id == id
+        assert definition.key == {Enum.join(metric.name, "."), expected_kind}
         assert definition.kind == expected_kind
       end
     end
@@ -30,10 +30,11 @@ defmodule TelemetryMetricsOTLP.DefinitionTest do
 
       assert %Definition{
                name: "my_app.request.count",
+               key: {"my_app.request.count", :counter},
                description: "Completed requests"
-             } = Definition.compile!(metric, 0)
+             } = Definition.compile!(metric)
 
-      assert Definition.compile!(sum("my_app.request.bytes"), 1).description == ""
+      assert Definition.compile!(sum("my_app.request.bytes")).description == ""
     end
 
     test "normalizes OTLP units" do
@@ -51,15 +52,15 @@ defmodule TelemetryMetricsOTLP.DefinitionTest do
         request: "request"
       ]
 
-      for {{unit, expected}, id} <- Enum.with_index(units) do
+      for {unit, expected} <- units do
         metric = last_value("my_app.request.value", unit: unit)
 
-        assert Definition.compile!(metric, id).unit == expected
+        assert Definition.compile!(metric).unit == expected
       end
     end
 
     test "stores default distribution bounds" do
-      definition = Definition.compile!(distribution("http.request.duration"), 0)
+      definition = Definition.compile!(distribution("http.request.duration"))
 
       assert definition.bounds == Definition.default_bounds()
 
@@ -91,7 +92,7 @@ defmodule TelemetryMetricsOTLP.DefinitionTest do
           reporter_options: [buckets: bounds]
         )
 
-      assert Definition.compile!(metric, 0).bounds === bounds
+      assert Definition.compile!(metric).bounds === bounds
     end
 
     test "allows an empty explicit-bound list" do
@@ -100,7 +101,7 @@ defmodule TelemetryMetricsOTLP.DefinitionTest do
           reporter_options: [buckets: []]
         )
 
-      assert Definition.compile!(metric, 0).bounds == []
+      assert Definition.compile!(metric).bounds == []
     end
 
     test "non-distribution metrics have no bounds" do
@@ -110,7 +111,7 @@ defmodule TelemetryMetricsOTLP.DefinitionTest do
         last_value("http.request.active", reporter_options: [buckets: [1, 2]])
       ]
 
-      assert Enum.all?(metrics, &(Definition.compile!(&1, 0).bounds == []))
+      assert Enum.all?(metrics, &(Definition.compile!(&1).bounds == []))
     end
 
     test "rejects non-list and non-numeric distribution bounds" do
@@ -120,7 +121,7 @@ defmodule TelemetryMetricsOTLP.DefinitionTest do
             reporter_options: [buckets: bounds]
           )
 
-        assert_raise ArgumentError, fn -> Definition.compile!(metric, 0) end
+        assert_raise ArgumentError, fn -> Definition.compile!(metric) end
       end
     end
 
@@ -132,24 +133,14 @@ defmodule TelemetryMetricsOTLP.DefinitionTest do
           )
 
         assert_raise ArgumentError, ~r/strictly increasing/, fn ->
-          Definition.compile!(metric, 0)
+          Definition.compile!(metric)
         end
       end
     end
 
     test "rejects unsupported metric kinds" do
       assert_raise ArgumentError, ~r/unsupported metric definition/, fn ->
-        Definition.compile!(summary("http.request.duration"), 0)
-      end
-    end
-
-    test "rejects ids outside the zero-based integer range" do
-      metric = counter("http.request.count")
-
-      for id <- [-1, 1.0, nil] do
-        assert_raise ArgumentError, ~r/non-negative integer/, fn ->
-          Definition.compile!(metric, id)
-        end
+        Definition.compile!(summary("http.request.duration"))
       end
     end
   end

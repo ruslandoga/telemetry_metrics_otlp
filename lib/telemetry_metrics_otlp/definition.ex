@@ -26,13 +26,14 @@ defmodule TelemetryMetricsOTLP.Definition do
     10_000
   ]
 
-  @enforce_keys [:id, :kind, :name, :description, :unit, :bounds]
-  defstruct [:id, :kind, :name, :description, :unit, :bounds]
+  @enforce_keys [:key, :kind, :name, :description, :unit, :bounds]
+  defstruct [:key, :kind, :name, :description, :unit, :bounds]
 
   @type kind :: :counter | :sum | :gauge | :histogram
+  @type key :: {name :: binary(), kind()}
 
   @type t :: %__MODULE__{
-          id: non_neg_integer(),
+          key: key(),
           kind: kind(),
           name: binary(),
           description: binary(),
@@ -48,32 +49,25 @@ defmodule TelemetryMetricsOTLP.Definition do
   def default_bounds, do: @default_bounds
 
   @doc """
-  Compiles a supported metric and its zero-based identifier into static OTLP
-  metadata.
+  Compiles a supported metric into static OTLP metadata.
 
-  Raises `ArgumentError` for an invalid identifier, an unsupported metric
-  type, or invalid distribution bounds.
+  Raises `ArgumentError` for an unsupported metric type or invalid
+  distribution bounds.
   """
-  @spec compile!(Telemetry.Metrics.t(), non_neg_integer()) :: t()
-  def compile!(metric, id) do
-    validate_id!(id)
+  @spec compile!(Telemetry.Metrics.t()) :: t()
+  def compile!(metric) do
     kind = kind!(metric)
+    name = Enum.map_join(metric.name, ".", &Atom.to_string/1)
     bounds = bounds!(metric)
 
     %__MODULE__{
-      id: id,
+      key: {name, kind},
       kind: kind,
-      name: Enum.map_join(metric.name, ".", &Atom.to_string/1),
+      name: name,
       description: normalize_description(metric.description),
       unit: normalize_unit(metric.unit),
       bounds: bounds
     }
-  end
-
-  defp validate_id!(id) when is_integer(id) and id >= 0, do: :ok
-
-  defp validate_id!(id) do
-    raise ArgumentError, "expected metric id to be a non-negative integer, got: #{inspect(id)}"
   end
 
   defp kind!(%Counter{}), do: :counter

@@ -7,6 +7,10 @@ defmodule TelemetryMetricsOTLP.Storage do
   returned value can select scheduler-local state and is reused by every metric
   produced by that event.
 
+  Every recording callback receives the semantic `{otlp_name, kind}` metric
+  key, where `otlp_name` is the prejoined binary name. Tags remain the
+  dimensions that identify individual series.
+
   Recording callbacks receive numeric values without coercion. Histogram
   bucket indexes are zero based and include an overflow bucket at
   `length(definition.bounds)`.
@@ -17,9 +21,9 @@ defmodule TelemetryMetricsOTLP.Storage do
   deliberately ignored so diagnostics cannot detach a telemetry handler.
   """
 
-  alias TelemetryMetricsOTLP.EventHandler
+  alias TelemetryMetricsOTLP.{Definition, EventHandler}
 
-  @type metric_id :: non_neg_integer()
+  @type metric_key :: Definition.key()
   @type state :: term()
   @type resolved :: term()
   @type tags :: map()
@@ -31,20 +35,20 @@ defmodule TelemetryMetricsOTLP.Storage do
   @doc "Resolves storage for the scheduler executing the current event."
   @callback resolve(state()) :: resolved()
 
-  @callback insert_counter(resolved(), metric_id(), tags()) :: term()
-  @callback insert_sum(resolved(), metric_id(), number(), tags()) :: term()
-  @callback insert_gauge(resolved(), metric_id(), number(), tags()) :: term()
+  @callback insert_counter(resolved(), metric_key(), tags()) :: term()
+  @callback insert_sum(resolved(), metric_key(), number(), tags()) :: term()
+  @callback insert_gauge(resolved(), metric_key(), number(), tags()) :: term()
 
   @callback insert_histogram(
               resolved(),
-              metric_id(),
+              metric_key(),
               number(),
               bucket_index :: non_neg_integer(),
               tags()
             ) :: term()
 
   @doc "Records a skipped observation without affecting sibling metrics."
-  @callback record_error(resolved(), metric_id(), error_reason()) :: term()
+  @callback record_error(resolved(), metric_key(), error_reason()) :: term()
 
   @doc "Releases storage after handlers have been detached."
   @callback terminate(state()) :: term()

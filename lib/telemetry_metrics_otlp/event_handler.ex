@@ -77,7 +77,7 @@ defmodule TelemetryMetricsOTLP.EventHandler do
       ) do
     # Telemetry invokes handlers synchronously and detaches a handler when an
     # exception escapes. Resolve once for this event, then keep failures local
-    # to the individual metric wherever a metric ID is available.
+    # to the individual metric wherever a semantic metric key is available.
     try do
       resolved = storage_module.resolve(storage)
 
@@ -92,7 +92,7 @@ defmodule TelemetryMetricsOTLP.EventHandler do
   end
 
   defp record_metric(
-         {metric, %Definition{id: metric_id} = definition},
+         {metric, %Definition{key: metric_key} = definition},
          measurements,
          metadata,
          resolved,
@@ -106,13 +106,13 @@ defmodule TelemetryMetricsOTLP.EventHandler do
         :ok
 
       {:error, reason} ->
-        record_error(event, resolved, metric_id, {:keep, reason})
+        record_error(event, resolved, metric_key, {:keep, reason})
     end
   end
 
   defp record_kept_metric(
          metric,
-         %Definition{id: metric_id, kind: :counter} = definition,
+         %Definition{key: metric_key, kind: :counter} = definition,
          _measurements,
          metadata,
          resolved,
@@ -120,13 +120,13 @@ defmodule TelemetryMetricsOTLP.EventHandler do
        ) do
     case tags(metric, metadata, event.extract_tags) do
       {:ok, tags} -> insert(event, resolved, definition, 1, tags)
-      {:error, reason} -> record_error(event, resolved, metric_id, {:tags, reason})
+      {:error, reason} -> record_error(event, resolved, metric_key, {:tags, reason})
     end
   end
 
   defp record_kept_metric(
          metric,
-         %Definition{id: metric_id} = definition,
+         %Definition{key: metric_key} = definition,
          measurements,
          metadata,
          resolved,
@@ -136,11 +136,11 @@ defmodule TelemetryMetricsOTLP.EventHandler do
       {:ok, value} ->
         case tags(metric, metadata, event.extract_tags) do
           {:ok, tags} -> insert(event, resolved, definition, value, tags)
-          {:error, reason} -> record_error(event, resolved, metric_id, {:tags, reason})
+          {:error, reason} -> record_error(event, resolved, metric_key, {:tags, reason})
         end
 
       {:error, reason} ->
-        record_error(event, resolved, metric_id, {:measurement, reason})
+        record_error(event, resolved, metric_key, {:measurement, reason})
     end
   end
 
@@ -247,7 +247,7 @@ defmodule TelemetryMetricsOTLP.EventHandler do
   defp insert(
          %Event{storage_module: storage_module} = event,
          resolved,
-         %Definition{id: metric_id} = definition,
+         %Definition{key: metric_key} = definition,
          value,
          tags
        ) do
@@ -255,50 +255,68 @@ defmodule TelemetryMetricsOTLP.EventHandler do
       result = insert_metric(storage_module, resolved, definition, value, tags)
 
       case result do
-        {:error, reason} -> record_error(event, resolved, metric_id, {:storage, reason})
+        {:error, reason} -> record_error(event, resolved, metric_key, {:storage, reason})
         _result -> :ok
       end
     rescue
       exception ->
-        record_error(event, resolved, metric_id, {:storage, {:error, exception}})
+        record_error(event, resolved, metric_key, {:storage, {:error, exception}})
     catch
       kind, reason ->
-        record_error(event, resolved, metric_id, {:storage, {kind, reason}})
+        record_error(event, resolved, metric_key, {:storage, {kind, reason}})
     end
-  end
-
-  defp insert_metric(storage_module, resolved, %Definition{id: id, kind: :counter}, _value, tags) do
-    storage_module.insert_counter(resolved, id, tags)
-  end
-
-  defp insert_metric(storage_module, resolved, %Definition{id: id, kind: :sum}, value, tags) do
-    storage_module.insert_sum(resolved, id, value, tags)
-  end
-
-  defp insert_metric(storage_module, resolved, %Definition{id: id, kind: :gauge}, value, tags) do
-    storage_module.insert_gauge(resolved, id, value, tags)
   end
 
   defp insert_metric(
          storage_module,
          resolved,
-         %Definition{id: id, kind: :histogram, bounds: bounds},
+         %Definition{key: metric_key, kind: :counter},
+         _value,
+         tags
+       ) do
+    storage_module.insert_counter(resolved, metric_key, tags)
+  end
+
+  defp insert_metric(
+         storage_module,
+         resolved,
+         %Definition{key: metric_key, kind: :sum},
+         value,
+         tags
+       ) do
+    storage_module.insert_sum(resolved, metric_key, value, tags)
+  end
+
+  defp insert_metric(
+         storage_module,
+         resolved,
+         %Definition{key: metric_key, kind: :gauge},
+         value,
+         tags
+       ) do
+    storage_module.insert_gauge(resolved, metric_key, value, tags)
+  end
+
+  defp insert_metric(
+         storage_module,
+         resolved,
+         %Definition{key: metric_key, kind: :histogram, bounds: bounds},
          value,
          tags
        ) do
     bucket_index = Enum.find_index(bounds, fn bound -> value <= bound end) || length(bounds)
-    storage_module.insert_histogram(resolved, id, value, bucket_index, tags)
+    storage_module.insert_histogram(resolved, metric_key, value, bucket_index, tags)
   end
 
   defp record_error(
          %Event{storage_module: storage_module},
          resolved,
-         metric_id,
+         metric_key,
          reason
        ) do
     if function_exported?(storage_module, :record_error, 3) do
       try do
-        storage_module.record_error(resolved, metric_id, reason)
+        storage_module.record_error(resolved, metric_key, reason)
       rescue
         _exception -> :ok
       catch

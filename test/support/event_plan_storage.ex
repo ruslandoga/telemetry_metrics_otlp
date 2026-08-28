@@ -29,32 +29,32 @@ defmodule TelemetryMetricsOTLP.Test.EventPlanStorage do
   end
 
   @impl true
-  def insert_counter(state, metric_id, tags) do
-    notify(state, {:insert_counter, metric_id, tags})
-    result(state, {:counter, metric_id})
+  def insert_counter(state, metric_key, tags) do
+    notify(state, {:insert_counter, metric_key, tags})
+    result(state, {:counter, metric_key})
   end
 
   @impl true
-  def insert_sum(state, metric_id, value, tags) do
-    notify(state, {:insert_sum, metric_id, value, tags})
-    result(state, {:sum, metric_id})
+  def insert_sum(state, metric_key, value, tags) do
+    notify(state, {:insert_sum, metric_key, value, tags})
+    result(state, {:sum, metric_key})
   end
 
   @impl true
-  def insert_gauge(state, metric_id, value, tags) do
-    notify(state, {:insert_gauge, metric_id, value, tags})
-    result(state, {:gauge, metric_id})
+  def insert_gauge(state, metric_key, value, tags) do
+    notify(state, {:insert_gauge, metric_key, value, tags})
+    result(state, {:gauge, metric_key})
   end
 
   @impl true
-  def insert_histogram(state, metric_id, value, bucket_index, tags) do
-    notify(state, {:insert_histogram, metric_id, value, bucket_index, tags})
-    result(state, {:histogram, metric_id})
+  def insert_histogram(state, metric_key, value, bucket_index, tags) do
+    notify(state, {:insert_histogram, metric_key, value, bucket_index, tags})
+    result(state, {:histogram, metric_key})
   end
 
   @impl true
-  def record_error(state, metric_id, reason) do
-    notify(state, {:record_error, metric_id, reason})
+  def record_error(state, metric_key, reason) do
+    notify(state, {:record_error, metric_key, reason})
     result(state, :record_error)
   end
 

@@ -7,7 +7,7 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
   alias TelemetryMetricsOTLP.EventPlan
   alias TelemetryMetricsOTLP.Test.EventPlanStorage, as: TestStorage
 
-  test "groups metrics by event while preserving compact IDs and static metadata" do
+  test "groups metrics by event while preserving semantic keys and static metadata" do
     first_event = unique_event(:first)
     second_event = unique_event(:second)
     state = storage_state()
@@ -36,8 +36,10 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
              {^first_event,
               %EventPlan.Event{
                 metrics: [
-                  {^first_metric, %TelemetryMetricsOTLP.Definition{id: 0}},
-                  {^third_metric, %TelemetryMetricsOTLP.Definition{id: 2}}
+                  {^first_metric,
+                   %TelemetryMetricsOTLP.Definition{key: {"checkout.payload.bytes", :sum}}},
+                  {^third_metric,
+                   %TelemetryMetricsOTLP.Definition{key: {"checkout.duration", :histogram}}}
                 ],
                 storage_module: TestStorage,
                 storage: ^state,
@@ -45,7 +47,12 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
               }},
              {^second_event,
               %EventPlan.Event{
-                metrics: [{^second_metric, %TelemetryMetricsOTLP.Definition{id: 1}}],
+                metrics: [
+                  {^second_metric,
+                   %TelemetryMetricsOTLP.Definition{
+                     key: {"checkout.completed.count", :counter}
+                   }}
+                ],
                 storage_module: TestStorage,
                 storage: ^state,
                 extract_tags: nil
@@ -54,29 +61,29 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert {:ok,
             %TelemetryMetricsOTLP.Definition{
-              id: 0,
+              key: {"checkout.payload.bytes", :sum},
               kind: :sum,
               name: "checkout.payload.bytes",
               description: "Payload size",
               unit: "By",
               bounds: []
-            }} = EventPlan.fetch_definition(plan, 0)
+            }} = EventPlan.fetch_definition(plan, {"checkout.payload.bytes", :sum})
 
     assert {:ok,
             %TelemetryMetricsOTLP.Definition{
-              id: 1,
+              key: {"checkout.completed.count", :counter},
               kind: :counter,
               name: "checkout.completed.count"
-            }} = EventPlan.fetch_definition(plan, 1)
+            }} = EventPlan.fetch_definition(plan, {"checkout.completed.count", :counter})
 
     assert {:ok,
             %TelemetryMetricsOTLP.Definition{
-              id: 2,
+              key: {"checkout.duration", :histogram},
               kind: :histogram,
               bounds: [0, 10, 100]
-            }} = EventPlan.fetch_definition(plan, 2)
+            }} = EventPlan.fetch_definition(plan, {"checkout.duration", :histogram})
 
-    assert :error = EventPlan.fetch_definition(plan, 3)
+    assert :error = EventPlan.fetch_definition(plan, {"missing", :sum})
 
     handler_ids = attach!(plan)
     assert Enum.map(handler_ids, &elem(&1, 2)) == [first_event, second_event]
@@ -85,8 +92,143 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert storage_events(state) == [
              {:resolve, self()},
-             {:insert_sum, 0, 23, %{}},
-             {:insert_histogram, 2, 10, 1, %{}}
+             {:insert_sum, {"checkout.payload.bytes", :sum}, 23, %{}},
+             {:insert_histogram, {"checkout.duration", :histogram}, 10, 1, %{}}
+           ]
+  end
+
+  test "distinguishes metric kinds that share the same normalized name and tags" do
+    event_name = unique_event(:same_name_different_kinds)
+    state = storage_state()
+
+    metrics = [
+      sum("pipeline.batch_size",
+        event_name: event_name,
+        measurement: :batch_size,
+        tags: [:backend_type]
+      ),
+      distribution("pipeline.batch_size",
+        event_name: event_name,
+        measurement: :batch_size,
+        tags: [:backend_type],
+        reporter_options: [buckets: [0, 10, 100]]
+      )
+    ]
+
+    plan = EventPlan.compile!(metrics, TestStorage, state)
+    assert EventPlan.size(plan) == 2
+    attach!(plan)
+
+    metadata = %{backend_type: :clickhouse}
+    :telemetry.execute(event_name, %{batch_size: 10}, metadata)
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:insert_sum, {"pipeline.batch_size", :sum}, 10, %{backend_type: :clickhouse}},
+             {:insert_histogram, {"pipeline.batch_size", :histogram}, 10, 1,
+              %{backend_type: :clickhouse}}
+           ]
+  end
+
+  test "rejects duplicate semantic keys with incompatible units" do
+    state = storage_state()
+
+    metrics = [
+      sum("duplicate.unit", unit: :byte),
+      sum("duplicate.unit", unit: :millisecond)
+    ]
+
+    exception =
+      assert_raise ArgumentError, fn ->
+        EventPlan.compile!(metrics, TestStorage, state)
+      end
+
+    assert Exception.message(exception) =~ "duplicate.unit"
+    assert Exception.message(exception) =~ "unit"
+  end
+
+  test "rejects duplicate histogram keys with incompatible bounds" do
+    state = storage_state()
+
+    metrics = [
+      distribution("duplicate.histogram", reporter_options: [buckets: [0, 10]]),
+      distribution("duplicate.histogram", reporter_options: [buckets: [0, 20]])
+    ]
+
+    exception =
+      assert_raise ArgumentError, fn ->
+        EventPlan.compile!(metrics, TestStorage, state)
+      end
+
+    assert Exception.message(exception) =~ "duplicate.histogram"
+    assert Exception.message(exception) =~ "bounds"
+  end
+
+  test "compatible duplicate keys share the canonical longer description" do
+    first_event = unique_event(:compatible_duplicate_first)
+    second_event = unique_event(:compatible_duplicate_second)
+    state = storage_state()
+
+    metrics = [
+      sum("duplicate.compatible",
+        event_name: first_event,
+        measurement: :value,
+        description: "Short"
+      ),
+      sum("duplicate.compatible",
+        event_name: second_event,
+        measurement: :value,
+        description: "A more useful metric description"
+      )
+    ]
+
+    plan = EventPlan.compile!(metrics, TestStorage, state)
+
+    assert EventPlan.size(plan) == 1
+
+    assert {:ok,
+            %TelemetryMetricsOTLP.Definition{
+              key: {"duplicate.compatible", :sum},
+              description: "A more useful metric description"
+            }} = EventPlan.fetch_definition(plan, {"duplicate.compatible", :sum})
+
+    attach!(plan)
+
+    :telemetry.execute(first_event, %{value: 2}, %{})
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:insert_sum, {"duplicate.compatible", :sum}, 2, %{}}
+           ]
+
+    :telemetry.execute(second_event, %{value: 3}, %{})
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:insert_sum, {"duplicate.compatible", :sum}, 3, %{}}
+           ]
+  end
+
+  test "records each compatible definition that shares an event and storage key" do
+    event_name = unique_event(:compatible_duplicate_event)
+    state = storage_state()
+
+    metrics = [
+      sum("duplicate.observations", event_name: event_name, measurement: :left),
+      sum("duplicate.observations", event_name: event_name, measurement: :right)
+    ]
+
+    plan = EventPlan.compile!(metrics, TestStorage, state)
+
+    assert EventPlan.size(plan) == 1
+    attach!(plan)
+
+    :telemetry.execute(event_name, %{left: 2, right: 3}, %{})
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:insert_sum, {"duplicate.observations", :sum}, 2, %{}},
+             {:insert_sum, {"duplicate.observations", :sum}, 3, %{}}
            ]
   end
 
@@ -123,9 +265,9 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     assert storage_events(state) == [
              {:resolve, self()},
              {:callback, :tag_values, metadata},
-             {:insert_sum, 0, 7, %{route: "/orders"}},
+             {:insert_sum, {"shared.left", :sum}, 7, %{route: "/orders"}},
              {:callback, :tag_values, metadata},
-             {:insert_gauge, 1, 2.5, %{route: "/orders"}}
+             {:insert_gauge, {"shared.right", :gauge}, 2.5, %{route: "/orders"}}
            ]
   end
 
@@ -153,9 +295,9 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     assert storage_events(state) == [
              {:resolve, self()},
              {:callback, :function_tags, metadata},
-             {:insert_counter, 0, %{tenant: "acme"}},
+             {:insert_counter, {"function_tags.count", :counter}, %{tenant: "acme"}},
              {:callback, :function_tags, metadata},
-             {:insert_sum, 1, 11, %{tenant: "acme"}}
+             {:insert_sum, {"function_tags.total", :sum}, 11, %{tenant: "acme"}}
            ]
   end
 
@@ -183,9 +325,9 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     assert storage_events(state) == [
              {:resolve, self()},
              {:callback, :custom_tags, [:custom, :first], metadata},
-             {:insert_counter, 0, %{metric: :first, tenant: "globex"}},
+             {:insert_counter, {"custom.first", :counter}, %{metric: :first, tenant: "globex"}},
              {:callback, :custom_tags, [:custom, :second], metadata},
-             {:insert_sum, 1, 19, %{metric: :second, tenant: "globex"}}
+             {:insert_sum, {"custom.second", :sum}, 19, %{metric: :second, tenant: "globex"}}
            ]
   end
 
@@ -249,10 +391,10 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
              {:resolve, self()},
              {:callback, :keep_one, metadata},
              {:callback, :measurement_one, measurements},
-             {:insert_sum, 0, 12, %{}},
+             {:insert_sum, {"keep.one", :sum}, 12, %{}},
              {:callback, :keep_two, metadata, measurements},
              {:callback, :measurement_two, measurements, metadata},
-             {:insert_gauge, 1, 12, %{}},
+             {:insert_gauge, {"keep.two", :gauge}, 12, %{}},
              {:callback, :keep_false, metadata}
            ]
   end
@@ -295,7 +437,7 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     assert storage_events(state) == [
              {:resolve, self()},
              {:callback, :keep, metadata},
-             {:record_error, 1, {:measurement, :missing}}
+             {:record_error, {"lazy.missing", :sum}, {:measurement, :missing}}
            ]
   end
 
@@ -320,9 +462,9 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert storage_events(state) == [
              {:resolve, self()},
-             {:insert_sum, 0, -9, %{}},
-             {:insert_gauge, 1, 3.5, %{}},
-             {:insert_sum, 2, 28, %{}}
+             {:insert_sum, {"measurement.key", :sum}, -9, %{}},
+             {:insert_gauge, {"measurement.one", :gauge}, 3.5, %{}},
+             {:insert_sum, {"measurement.two", :sum}, 28, %{}}
            ]
   end
 
@@ -359,9 +501,9 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert storage_events(state) == [
              {:resolve, self()},
-             {:insert_counter, 0, %{}},
+             {:insert_counter, {"counter.fast", :counter}, %{}},
              {:callback, :counter_keep, metadata, measurements},
-             {:insert_counter, 1, %{}}
+             {:insert_counter, {"counter.kept", :counter}, %{}}
            ]
   end
 
@@ -378,7 +520,11 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     for value <- values do
       :telemetry.execute(event_name, %{value: value}, %{})
 
-      assert [{:resolve, _pid}, {:insert_sum, 0, stored, %{}}] = storage_events(state)
+      assert [
+               {:resolve, _pid},
+               {:insert_sum, {"numeric.value", :sum}, stored, %{}}
+             ] = storage_events(state)
+
       assert stored === value
     end
   end
@@ -413,20 +559,22 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert [
              {:resolve, _pid},
-             {:record_error, 0, {:measurement, :missing}},
-             {:record_error, 1, {:measurement, nil}},
-             {:record_error, 2, {:measurement, :not_number}},
-             {:record_error, 3,
+             {:record_error, {"failure.missing", :sum}, {:measurement, :missing}},
+             {:record_error, {"failure.nil", :sum}, {:measurement, nil}},
+             {:record_error, {"failure.non_numeric", :gauge}, {:measurement, :not_number}},
+             {:record_error, {"failure.raise", :sum},
               {:measurement, {:error, %RuntimeError{message: "measurement raised"}}}},
-             {:record_error, 4, {:measurement, {:throw, :measurement_thrown}}},
-             {:record_error, 5, {:measurement, {:exit, :measurement_exited}}},
-             {:insert_sum, 6, 41, %{}}
+             {:record_error, {"failure.throw", :sum},
+              {:measurement, {:throw, :measurement_thrown}}},
+             {:record_error, {"failure.exit", :sum},
+              {:measurement, {:exit, :measurement_exited}}},
+             {:insert_sum, {"failure.sibling", :sum}, 41, %{}}
            ] = storage_events(state)
 
     assert handler_id in handler_ids_for(event_name)
 
     :telemetry.execute(event_name, %{nil_value: nil, text: :bad, good: 42}, %{})
-    assert {:insert_sum, 6, 42, %{}} in storage_events(state)
+    assert {:insert_sum, {"failure.sibling", :sum}, 42, %{}} in storage_events(state)
   end
 
   test "records invalid keep and tag callbacks without suppressing sibling metrics" do
@@ -477,17 +625,18 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert [
              {:resolve, _pid},
-             {:record_error, 0, {:keep, :invalid_return}},
-             {:record_error, 1, {:keep, {:error, %RuntimeError{message: "keep raised"}}}},
+             {:record_error, {"callback.invalid_keep", :sum}, {:keep, :invalid_return}},
+             {:record_error, {"callback.raised_keep", :sum},
+              {:keep, {:error, %RuntimeError{message: "keep raised"}}}},
              {:callback, :shared_bad_tags, ^metadata},
-             {:record_error, 2,
+             {:record_error, {"callback.bad_tags_one", :sum},
               {:tags, {:error, %RuntimeError{message: "tag extraction raised"}}}},
              {:callback, :shared_bad_tags, ^metadata},
-             {:record_error, 3,
+             {:record_error, {"callback.bad_tags_two", :counter},
               {:tags, {:error, %RuntimeError{message: "tag extraction raised"}}}},
              {:callback, :invalid_tags, ^metadata},
-             {:record_error, 4, {:tags, :invalid_return}},
-             {:insert_sum, 5, 5, %{}}
+             {:record_error, {"callback.invalid_tags", :sum}, {:tags, :invalid_return}},
+             {:insert_sum, {"callback.good_sibling", :sum}, 5, %{}}
            ] = storage_events(state)
   end
 
@@ -497,9 +646,9 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     state =
       storage_state(%{
         failures: %{
-          {:sum, 0} => {:return, {:error, :busy}},
-          {:gauge, 1} => {:raise, "gauge insert raised"},
-          {:counter, 2} => {:throw, :counter_insert_thrown},
+          {:sum, {"storage.sum", :sum}} => {:return, {:error, :busy}},
+          {:gauge, {"storage.gauge", :gauge}} => {:raise, "gauge insert raised"},
+          {:counter, {"storage.counter", :counter}} => {:throw, :counter_insert_thrown},
           :record_error => {:raise, "diagnostics unavailable"}
         }
       })
@@ -518,14 +667,15 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert [
              {:resolve, _pid},
-             {:insert_sum, 0, 8, %{}},
-             {:record_error, 0, {:storage, :busy}},
-             {:insert_gauge, 1, 8, %{}},
-             {:record_error, 1,
+             {:insert_sum, {"storage.sum", :sum}, 8, %{}},
+             {:record_error, {"storage.sum", :sum}, {:storage, :busy}},
+             {:insert_gauge, {"storage.gauge", :gauge}, 8, %{}},
+             {:record_error, {"storage.gauge", :gauge},
               {:storage, {:error, %RuntimeError{message: "gauge insert raised"}}}},
-             {:insert_counter, 2, %{}},
-             {:record_error, 2, {:storage, {:throw, :counter_insert_thrown}}},
-             {:insert_sum, 3, 8, %{}}
+             {:insert_counter, {"storage.counter", :counter}, %{}},
+             {:record_error, {"storage.counter", :counter},
+              {:storage, {:throw, :counter_insert_thrown}}},
+             {:insert_sum, {"storage.sibling", :sum}, 8, %{}}
            ] = storage_events(state)
 
     assert handler_id in handler_ids_for(event_name)
@@ -552,7 +702,7 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
       assert [
                {:resolve, _pid},
-               {:insert_histogram, 0, stored, ^expected_bucket, %{}}
+               {:insert_histogram, {"histogram.value", :histogram}, stored, ^expected_bucket, %{}}
              ] = storage_events(state)
 
       assert stored === value
@@ -596,12 +746,12 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert storage_events(state_one) == [
              {:resolve, self()},
-             {:insert_counter, 0, %{}}
+             {:insert_counter, {"reporter.lifecycle.count", :counter}, %{}}
            ]
 
     assert storage_events(state_two) == [
              {:resolve, self()},
-             {:insert_counter, 0, %{}}
+             {:insert_counter, {"reporter.lifecycle.count", :counter}, %{}}
            ]
 
     :ok = GenServer.stop(reporter_one)
@@ -613,7 +763,7 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert storage_events(state_two) == [
              {:resolve, self()},
-             {:insert_counter, 0, %{}}
+             {:insert_counter, {"reporter.lifecycle.count", :counter}, %{}}
            ]
 
     :ok = GenServer.stop(reporter_two)
@@ -638,7 +788,7 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert storage_events(restarted_state) == [
              {:resolve, self()},
-             {:insert_counter, 0, %{}}
+             {:insert_counter, {"reporter.lifecycle.count", :counter}, %{}}
            ]
 
     :ok = GenServer.stop(restarted)
@@ -706,7 +856,7 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert storage_events(restarted_state) == [
              {:resolve, self()},
-             {:insert_counter, 0, %{}}
+             {:insert_counter, {"restart.retained.count", :counter}, %{}}
            ]
 
     :ok = GenServer.stop(restarted)

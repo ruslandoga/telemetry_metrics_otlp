@@ -11,11 +11,16 @@ storage contract that a cumulative scheduler-keyed backend will implement.
 
 At startup, the reporter:
 
-- assigns compact zero-based metric IDs;
-- stores normalized OTLP metadata in an ID-addressable tuple;
+- prejoins metric names and normalizes their static OTLP metadata;
+- indexes definitions by the semantic `{name, kind}` storage key;
+- rejects definitions that would merge incompatible units or histogram bounds;
 - groups metrics by telemetry event;
 - initializes storage before attaching handlers; and
 - retains stable reporter-scoped handler IDs for cleanup and restart.
+
+Compatible definitions sharing `{name, kind}` remain separate recording
+operations under the same metric identity; matching tags aggregate into the
+same series. Plan size and metadata lookup operate on unique identities.
 
 When an event is emitted, its handler resolves storage once and processes each
 metric in definition order. The control flow is deliberately direct:
@@ -37,9 +42,10 @@ Supported definitions are counters, sums, last values (OTLP gauges), and
 distributions (OTLP explicit histograms). Summaries are intentionally rejected.
 
 This implementation intentionally favors simple control flow over speculative
-hot-path specialization. Optimized records, prebound insert closures, shared
-tag extraction, and alternative bucket lookup strategies can be compared
-against it in a representative benchmark before being adopted.
+hot-path specialization. Compact integer IDs, optimized records, prebound
+insert closures, shared tag extraction, and alternative bucket lookup
+strategies can be compared against it in a representative benchmark before
+being adopted.
 
 ## Starting a reporter
 
