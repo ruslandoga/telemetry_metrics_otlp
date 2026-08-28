@@ -1,14 +1,12 @@
-{:ok, _finch} = Finch.start_link(name: :default)
+{:ok, _finch} = Help.setup()
 
-request =
-  Finch.build(
-    :post,
-    "http://localhost:4318/v1/metrics",
-    [{"content-type", "application/x-protobuf"}],
-    <<>>
-  )
-
-case Finch.request(request, :default, receive_timeout: to_timeout(second: 1)) do
+case Help.http(
+       :post,
+       "http://localhost:4318/v1/metrics",
+       [{"content-type", "application/x-protobuf"}],
+       <<>>,
+       receive_timeout: to_timeout(second: 1)
+     ) do
   {:ok, %Finch.Response{status: 200}} ->
     :ok
 
