@@ -1,12 +1,9 @@
-{:ok, _finch} = Help.setup()
+Help.setup()
 
-case Help.http(
-       :post,
-       "http://localhost:4318/v1/metrics",
-       [{"content-type", "application/x-protobuf"}],
-       <<>>,
-       receive_timeout: to_timeout(second: 1)
-     ) do
+otlp_url = "http://localhost:4318/v1/metrics"
+otlp_headers = [{"content-type", "application/x-protobuf"}]
+
+case Help.http(:post, otlp_url, otlp_headers) do
   {:ok, %Finch.Response{status: 200}} ->
     :ok
 
