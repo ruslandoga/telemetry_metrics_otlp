@@ -20,6 +20,14 @@ defmodule TelemetryMetricsOTLP.MixProject do
 
   # Run "mix help deps" to learn about dependencies.
   defp deps do
-    []
+    [
+      {:telemetry, "~> 1.4"},
+      {:telemetry_metrics, "~> 1.2"},
+      {:nimble_options, "~> 1.1"},
+      {:protox, "~> 2.0"},
+      {:finch, "~> 0.23.0"},
+      {:stream_data, "~> 1.4", only: :test},
+      {:benchee, "~> 1.5", only: :dev, runtime: false}
+    ]
   end
 end
