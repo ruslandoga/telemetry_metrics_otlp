@@ -15,6 +15,7 @@ At startup, the reporter:
 - indexes definitions by the semantic `{name, kind}` storage key;
 - rejects definitions that would merge incompatible units or histogram bounds;
 - groups metrics by telemetry event;
+- completes the static event plan before initializing storage;
 - initializes storage before attaching handlers; and
 - retains stable reporter-scoped handler IDs for cleanup and restart.
 

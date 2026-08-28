@@ -67,8 +67,4 @@ defmodule TelemetryMetricsOTLP do
   @doc "Returns the immutable compiled event plan for a running reporter."
   @spec event_plan(GenServer.server()) :: EventPlan.t()
   def event_plan(reporter), do: GenServer.call(reporter, :plan)
-
-  @doc false
-  @spec handler_ids(GenServer.server()) :: [term()]
-  def handler_ids(reporter), do: GenServer.call(reporter, :handler_ids)
 end

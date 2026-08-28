@@ -2,7 +2,22 @@ defmodule TelemetryMetricsOTLP.EventHandler do
   @moduledoc false
 
   alias TelemetryMetricsOTLP.Definition
-  alias TelemetryMetricsOTLP.EventPlan.Event
+
+  defmodule Config do
+    @moduledoc false
+
+    alias TelemetryMetricsOTLP.Definition
+
+    @enforce_keys [:metrics, :storage_module, :storage, :extract_tags]
+    defstruct [:metrics, :storage_module, :storage, :extract_tags]
+
+    @type t :: %__MODULE__{
+            metrics: [{Telemetry.Metrics.t(), Definition.t()}],
+            storage_module: module(),
+            storage: term(),
+            extract_tags: nil | (Telemetry.Metrics.t(), :telemetry.event_metadata() -> map())
+          }
+  end
 
   @type callback_failure :: {:error | :exit | :throw, term()}
 
@@ -14,14 +29,27 @@ defmodule TelemetryMetricsOTLP.EventHandler do
 
   @type handler_id :: {module(), term(), :telemetry.event_name()}
 
-  @spec attach([{Telemetry.event_name(), Event.t()}], term()) ::
+  @spec attach(
+          %{optional(Telemetry.event_name()) => [{Telemetry.Metrics.t(), Definition.t()}]},
+          term(),
+          module(),
+          term(),
+          nil | (Telemetry.Metrics.t(), :telemetry.event_metadata() -> map())
+        ) ::
           {:ok, [handler_id()]} | {:error, term()}
-  def attach(events, instance_id) do
+  def attach(events, instance_id, storage_module, storage, extract_tags) do
     result =
-      Enum.reduce_while(events, {:ok, []}, fn {event_name, event}, {:ok, ids} ->
+      Enum.reduce_while(events, {:ok, []}, fn {event_name, metrics}, {:ok, ids} ->
         handler_id = handler_id(instance_id, event_name)
 
-        case :telemetry.attach(handler_id, event_name, &__MODULE__.handle_event/4, event) do
+        config = %Config{
+          metrics: metrics,
+          storage_module: storage_module,
+          storage: storage,
+          extract_tags: extract_tags
+        }
+
+        case attach_handler(handler_id, event_name, config) do
           :ok ->
             {:cont, {:ok, [handler_id | ids]}}
 
@@ -34,6 +62,16 @@ defmodule TelemetryMetricsOTLP.EventHandler do
     case result do
       {:ok, ids} -> {:ok, Enum.reverse(ids)}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp attach_handler(handler_id, event_name, config) do
+    try do
+      :telemetry.attach(handler_id, event_name, &__MODULE__.handle_event/4, config)
+    rescue
+      exception -> {:error, {:error, exception}}
+    catch
+      kind, reason -> {:error, {kind, reason}}
     end
   end
 
@@ -67,13 +105,13 @@ defmodule TelemetryMetricsOTLP.EventHandler do
           :telemetry.event_name(),
           :telemetry.event_measurements(),
           :telemetry.event_metadata(),
-          Event.t()
+          Config.t()
         ) :: :ok
   def handle_event(
         _event_name,
         measurements,
         metadata,
-        %Event{metrics: metrics, storage_module: storage_module, storage: storage} = event
+        %Config{metrics: metrics, storage_module: storage_module, storage: storage} = config
       ) do
     # Telemetry invokes handlers synchronously and detaches a handler when an
     # exception escapes. Resolve once for this event, then keep failures local
@@ -82,7 +120,7 @@ defmodule TelemetryMetricsOTLP.EventHandler do
       resolved = storage_module.resolve(storage)
 
       Enum.each(metrics, fn metric ->
-        record_metric(metric, measurements, metadata, resolved, event)
+        record_metric(metric, measurements, metadata, resolved, config)
       end)
     rescue
       _exception -> :ok
@@ -96,17 +134,17 @@ defmodule TelemetryMetricsOTLP.EventHandler do
          measurements,
          metadata,
          resolved,
-         event
+         config
        ) do
     case keep?(metric.keep, metadata, measurements) do
       {:ok, true} ->
-        record_kept_metric(metric, definition, measurements, metadata, resolved, event)
+        record_kept_metric(metric, definition, measurements, metadata, resolved, config)
 
       {:ok, false} ->
         :ok
 
       {:error, reason} ->
-        record_error(event, resolved, metric_key, {:keep, reason})
+        record_error(config, resolved, metric_key, {:keep, reason})
     end
   end
 
@@ -116,11 +154,11 @@ defmodule TelemetryMetricsOTLP.EventHandler do
          _measurements,
          metadata,
          resolved,
-         event
+         config
        ) do
-    case tags(metric, metadata, event.extract_tags) do
-      {:ok, tags} -> insert(event, resolved, definition, 1, tags)
-      {:error, reason} -> record_error(event, resolved, metric_key, {:tags, reason})
+    case tags(metric, metadata, config.extract_tags) do
+      {:ok, tags} -> insert(config, resolved, definition, 1, tags)
+      {:error, reason} -> record_error(config, resolved, metric_key, {:tags, reason})
     end
   end
 
@@ -130,17 +168,17 @@ defmodule TelemetryMetricsOTLP.EventHandler do
          measurements,
          metadata,
          resolved,
-         event
+         config
        ) do
     case measurement(metric.measurement, measurements, metadata) do
       {:ok, value} ->
-        case tags(metric, metadata, event.extract_tags) do
-          {:ok, tags} -> insert(event, resolved, definition, value, tags)
-          {:error, reason} -> record_error(event, resolved, metric_key, {:tags, reason})
+        case tags(metric, metadata, config.extract_tags) do
+          {:ok, tags} -> insert(config, resolved, definition, value, tags)
+          {:error, reason} -> record_error(config, resolved, metric_key, {:tags, reason})
         end
 
       {:error, reason} ->
-        record_error(event, resolved, metric_key, {:measurement, reason})
+        record_error(config, resolved, metric_key, {:measurement, reason})
     end
   end
 
@@ -245,7 +283,7 @@ defmodule TelemetryMetricsOTLP.EventHandler do
   defp validate_tags(_tags), do: {:error, :invalid_return}
 
   defp insert(
-         %Event{storage_module: storage_module} = event,
+         %Config{storage_module: storage_module} = config,
          resolved,
          %Definition{key: metric_key} = definition,
          value,
@@ -255,15 +293,15 @@ defmodule TelemetryMetricsOTLP.EventHandler do
       result = insert_metric(storage_module, resolved, definition, value, tags)
 
       case result do
-        {:error, reason} -> record_error(event, resolved, metric_key, {:storage, reason})
+        {:error, reason} -> record_error(config, resolved, metric_key, {:storage, reason})
         _result -> :ok
       end
     rescue
       exception ->
-        record_error(event, resolved, metric_key, {:storage, {:error, exception}})
+        record_error(config, resolved, metric_key, {:storage, {:error, exception}})
     catch
       kind, reason ->
-        record_error(event, resolved, metric_key, {:storage, {kind, reason}})
+        record_error(config, resolved, metric_key, {:storage, {kind, reason}})
     end
   end
 
@@ -309,7 +347,7 @@ defmodule TelemetryMetricsOTLP.EventHandler do
   end
 
   defp record_error(
-         %Event{storage_module: storage_module},
+         %Config{storage_module: storage_module},
          resolved,
          metric_key,
          reason

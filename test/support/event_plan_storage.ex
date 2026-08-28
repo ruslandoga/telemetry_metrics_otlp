@@ -15,6 +15,11 @@ defmodule TelemetryMetricsOTLP.Test.EventPlanStorage do
 
     notify(state, {:init, self(), handler_count})
 
+    case Map.get(state, :on_init) do
+      on_init when is_function(on_init, 0) -> on_init.()
+      nil -> :ok
+    end
+
     case failure(state, :init) do
       :ok -> {:ok, state}
       result -> result

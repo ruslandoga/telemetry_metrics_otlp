@@ -11,7 +11,6 @@ defmodule TelemetryMetricsOTLP.Reporter do
     @moduledoc false
 
     @enforce_keys [
-      :instance_id,
       :plan,
       :handler_ids,
       :storage_module,
@@ -38,12 +37,12 @@ defmodule TelemetryMetricsOTLP.Reporter do
 
     case validate_storage(storage_module) do
       :ok ->
-        case init_storage(storage_module, storage_options) do
-          {:ok, storage} ->
-            start_plan(options, storage_module, storage)
+        case EventPlan.compile(options.metrics, options.extract_tags) do
+          {:ok, plan} ->
+            start_storage(options.name, plan, storage_module, storage_options)
 
           {:error, reason} ->
-            {:stop, {:storage_init_failed, reason}}
+            {:stop, {:event_plan_failed, reason}}
         end
 
       {:error, reason} ->
@@ -57,43 +56,42 @@ defmodule TelemetryMetricsOTLP.Reporter do
   end
 
   @impl true
-  def handle_call(:handler_ids, _from, %State{handler_ids: handler_ids} = state) do
-    {:reply, handler_ids, state}
-  end
-
-  @impl true
   def terminate(_reason, %State{} = state) do
     EventHandler.detach(state.handler_ids)
     Storage.terminate(state.storage_module, state.storage)
   end
 
-  defp start_plan(options, storage_module, storage) do
-    plan_options = [extract_tags: options.extract_tags]
+  defp start_storage(instance_id, plan, storage_module, storage_options) do
+    case init_storage(storage_module, storage_options) do
+      {:ok, storage} ->
+        attach_plan(instance_id, plan, storage_module, storage)
 
-    case EventPlan.compile(options.metrics, storage_module, storage, plan_options) do
-      {:ok, plan} ->
-        instance_id = options.name
+      {:error, reason} ->
+        {:stop, {:storage_init_failed, reason}}
+    end
+  end
 
-        case EventHandler.attach(plan.events, instance_id) do
-          {:ok, handler_ids} ->
-            state = %State{
-              instance_id: instance_id,
-              plan: plan,
-              handler_ids: handler_ids,
-              storage_module: storage_module,
-              storage: storage
-            }
+  defp attach_plan(instance_id, plan, storage_module, storage) do
+    case EventHandler.attach(
+           plan.events,
+           instance_id,
+           storage_module,
+           storage,
+           plan.extract_tags
+         ) do
+      {:ok, handler_ids} ->
+        state = %State{
+          plan: plan,
+          handler_ids: handler_ids,
+          storage_module: storage_module,
+          storage: storage
+        }
 
-            {:ok, state}
-
-          {:error, reason} ->
-            Storage.terminate(storage_module, storage)
-            {:stop, reason}
-        end
+        {:ok, state}
 
       {:error, reason} ->
         Storage.terminate(storage_module, storage)
-        {:stop, {:event_plan_failed, reason}}
+        {:stop, reason}
     end
   end
 

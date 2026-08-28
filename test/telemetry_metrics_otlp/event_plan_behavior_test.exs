@@ -28,36 +28,26 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     ]
 
     [first_metric, second_metric, third_metric] = metrics
-    plan = EventPlan.compile!(metrics, TestStorage, state)
+    plan = EventPlan.compile!(metrics)
 
     assert EventPlan.size(plan) == 3
 
-    assert [
-             {^first_event,
-              %EventPlan.Event{
-                metrics: [
-                  {^first_metric,
-                   %TelemetryMetricsOTLP.Definition{key: {"checkout.payload.bytes", :sum}}},
-                  {^third_metric,
-                   %TelemetryMetricsOTLP.Definition{key: {"checkout.duration", :histogram}}}
-                ],
-                storage_module: TestStorage,
-                storage: ^state,
-                extract_tags: nil
-              }},
-             {^second_event,
-              %EventPlan.Event{
-                metrics: [
-                  {^second_metric,
-                   %TelemetryMetricsOTLP.Definition{
-                     key: {"checkout.completed.count", :counter}
-                   }}
-                ],
-                storage_module: TestStorage,
-                storage: ^state,
-                extract_tags: nil
-              }}
-           ] = plan.events
+    assert %{
+             ^first_event => [
+               {^first_metric,
+                %TelemetryMetricsOTLP.Definition{key: {"checkout.payload.bytes", :sum}}},
+               {^third_metric,
+                %TelemetryMetricsOTLP.Definition{key: {"checkout.duration", :histogram}}}
+             ],
+             ^second_event => [
+               {^second_metric,
+                %TelemetryMetricsOTLP.Definition{
+                  key: {"checkout.completed.count", :counter}
+                }}
+             ]
+           } = plan.events
+
+    assert plan.extract_tags == nil
 
     assert {:ok,
             %TelemetryMetricsOTLP.Definition{
@@ -85,8 +75,10 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert :error = EventPlan.fetch_definition(plan, {"missing", :sum})
 
-    handler_ids = attach!(plan)
-    assert Enum.map(handler_ids, &elem(&1, 2)) == [first_event, second_event]
+    handler_ids = attach!(plan, state)
+
+    assert MapSet.new(Enum.map(handler_ids, &elem(&1, 2))) ==
+             MapSet.new([first_event, second_event])
 
     :telemetry.execute(first_event, %{bytes: 23, duration: 10}, %{})
 
@@ -115,9 +107,9 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
       )
     ]
 
-    plan = EventPlan.compile!(metrics, TestStorage, state)
+    plan = EventPlan.compile!(metrics)
     assert EventPlan.size(plan) == 2
-    attach!(plan)
+    attach!(plan, state)
 
     metadata = %{backend_type: :clickhouse}
     :telemetry.execute(event_name, %{batch_size: 10}, metadata)
@@ -131,8 +123,6 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
   end
 
   test "rejects duplicate semantic keys with incompatible units" do
-    state = storage_state()
-
     metrics = [
       sum("duplicate.unit", unit: :byte),
       sum("duplicate.unit", unit: :millisecond)
@@ -140,7 +130,7 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     exception =
       assert_raise ArgumentError, fn ->
-        EventPlan.compile!(metrics, TestStorage, state)
+        EventPlan.compile!(metrics)
       end
 
     assert Exception.message(exception) =~ "duplicate.unit"
@@ -148,8 +138,6 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
   end
 
   test "rejects duplicate histogram keys with incompatible bounds" do
-    state = storage_state()
-
     metrics = [
       distribution("duplicate.histogram", reporter_options: [buckets: [0, 10]]),
       distribution("duplicate.histogram", reporter_options: [buckets: [0, 20]])
@@ -157,7 +145,7 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     exception =
       assert_raise ArgumentError, fn ->
-        EventPlan.compile!(metrics, TestStorage, state)
+        EventPlan.compile!(metrics)
       end
 
     assert Exception.message(exception) =~ "duplicate.histogram"
@@ -182,7 +170,7 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
       )
     ]
 
-    plan = EventPlan.compile!(metrics, TestStorage, state)
+    plan = EventPlan.compile!(metrics)
 
     assert EventPlan.size(plan) == 1
 
@@ -192,7 +180,11 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
               description: "A more useful metric description"
             }} = EventPlan.fetch_definition(plan, {"duplicate.compatible", :sum})
 
-    attach!(plan)
+    assert Enum.all?(plan.events, fn {_event_name, [{_metric, definition}]} ->
+             definition.description == "A more useful metric description"
+           end)
+
+    attach!(plan, state)
 
     :telemetry.execute(first_event, %{value: 2}, %{})
 
@@ -218,10 +210,10 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
       sum("duplicate.observations", event_name: event_name, measurement: :right)
     ]
 
-    plan = EventPlan.compile!(metrics, TestStorage, state)
+    plan = EventPlan.compile!(metrics)
 
     assert EventPlan.size(plan) == 1
-    attach!(plan)
+    attach!(plan, state)
 
     :telemetry.execute(event_name, %{left: 2, right: 3}, %{})
 
@@ -230,6 +222,17 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
              {:insert_sum, {"duplicate.observations", :sum}, 2, %{}},
              {:insert_sum, {"duplicate.observations", :sum}, 3, %{}}
            ]
+  end
+
+  test "chooses duplicate descriptions deterministically when their lengths match" do
+    plan =
+      EventPlan.compile!([
+        sum("duplicate.description", description: "Zulu"),
+        sum("duplicate.description", description: "Able")
+      ])
+
+    assert {:ok, %{description: "Able"}} =
+             EventPlan.fetch_definition(plan, {"duplicate.description", :sum})
   end
 
   test "resolves storage once and extracts list-based tags for each metric" do
@@ -256,8 +259,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
       )
     ]
 
-    plan = EventPlan.compile!(metrics, TestStorage, state)
-    attach!(plan)
+    plan = EventPlan.compile!(metrics)
+    attach!(plan, state)
 
     metadata = %{route: "/orders", ignored: :value}
     :telemetry.execute(event_name, %{left: 7, right: 2.5}, metadata)
@@ -269,6 +272,12 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
              {:callback, :tag_values, metadata},
              {:insert_gauge, {"shared.right", :gauge}, 2.5, %{route: "/orders"}}
            ]
+  end
+
+  test "rejects an invalid reporter-level tag extractor" do
+    assert_raise ArgumentError, ~r/expected extract_tags/, fn ->
+      EventPlan.compile!([], fn _metadata -> %{} end)
+    end
   end
 
   test "extracts function-valued tags for each metric" do
@@ -286,8 +295,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     ]
 
     metrics
-    |> EventPlan.compile!(TestStorage, state)
-    |> attach!()
+    |> EventPlan.compile!()
+    |> attach!(state)
 
     metadata = %{tenant: "acme", ignored: true}
     :telemetry.execute(event_name, %{amount: 11}, metadata)
@@ -316,8 +325,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     end
 
     metrics
-    |> EventPlan.compile!(TestStorage, state, extract_tags: extract_tags)
-    |> attach!()
+    |> EventPlan.compile!(extract_tags)
+    |> attach!(state)
 
     metadata = %{tenant: "globex"}
     :telemetry.execute(event_name, %{amount: 19}, metadata)
@@ -380,8 +389,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     ]
 
     metrics
-    |> EventPlan.compile!(TestStorage, state)
-    |> attach!()
+    |> EventPlan.compile!()
+    |> attach!(state)
 
     measurements = %{left: 12, right: 4}
     metadata = %{accept: true, multiplier: 3}
@@ -428,8 +437,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     ]
 
     metrics
-    |> EventPlan.compile!(TestStorage, state)
-    |> attach!()
+    |> EventPlan.compile!()
+    |> attach!(state)
 
     metadata = %{tenant: "umbrella"}
     :telemetry.execute(event_name, %{}, metadata)
@@ -455,8 +464,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     ]
 
     metrics
-    |> EventPlan.compile!(TestStorage, state)
-    |> attach!()
+    |> EventPlan.compile!()
+    |> attach!(state)
 
     :telemetry.execute(event_name, %{direct: -9, base: 7}, %{factor: 4})
 
@@ -492,8 +501,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     ]
 
     metrics
-    |> EventPlan.compile!(TestStorage, state)
-    |> attach!()
+    |> EventPlan.compile!()
+    |> attach!(state)
 
     measurements = %{anything: :malformed}
     metadata = %{keep: true}
@@ -512,8 +521,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     state = storage_state()
 
     [sum("numeric.value", event_name: event_name, measurement: :value)]
-    |> EventPlan.compile!(TestStorage, state)
-    |> attach!()
+    |> EventPlan.compile!()
+    |> attach!(state)
 
     values = [-1_208_925_819_614_629_174_706_176, -3.75, 0, 0.0]
 
@@ -552,8 +561,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
       sum("failure.sibling", event_name: event_name, measurement: :good)
     ]
 
-    plan = EventPlan.compile!(metrics, TestStorage, state)
-    [handler_id] = attach!(plan)
+    plan = EventPlan.compile!(metrics)
+    [handler_id] = attach!(plan, state)
 
     :telemetry.execute(event_name, %{nil_value: nil, text: "bad", good: 41}, %{})
 
@@ -617,8 +626,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     ]
 
     metrics
-    |> EventPlan.compile!(TestStorage, state)
-    |> attach!()
+    |> EventPlan.compile!()
+    |> attach!(state)
 
     metadata = %{tenant: "initech"}
     :telemetry.execute(event_name, %{value: 5}, metadata)
@@ -660,8 +669,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
       sum("storage.sibling", event_name: event_name, measurement: :value)
     ]
 
-    plan = EventPlan.compile!(metrics, TestStorage, state)
-    [handler_id] = attach!(plan)
+    plan = EventPlan.compile!(metrics)
+    [handler_id] = attach!(plan, state)
 
     :telemetry.execute(event_name, %{value: 8}, %{})
 
@@ -692,8 +701,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
         reporter_options: [buckets: [-1, 0, 2.5]]
       )
     ]
-    |> EventPlan.compile!(TestStorage, state)
-    |> attach!()
+    |> EventPlan.compile!()
+    |> attach!(state)
 
     observations = [{-2, 0}, {-1, 0}, {0, 1}, {2.5, 2}, {2.500_001, 3}]
 
@@ -737,8 +746,8 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     stop_on_exit(reporter_two)
     assert [{:init, ^reporter_two, 1}] = storage_events(state_two)
 
-    [handler_one] = TelemetryMetricsOTLP.handler_ids(reporter_one)
-    [handler_two] = TelemetryMetricsOTLP.handler_ids(reporter_two)
+    handler_one = EventHandler.handler_id(name_one, event_name)
+    handler_two = EventHandler.handler_id(name_two, event_name)
     refute handler_one == handler_two
     assert MapSet.new(handler_ids_for(event_name)) == MapSet.new([handler_one, handler_two])
 
@@ -781,8 +790,7 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     stop_on_exit(restarted)
     assert [{:init, ^restarted, 0}] = storage_events(restarted_state)
-    [restarted_handler] = TelemetryMetricsOTLP.handler_ids(restarted)
-    assert restarted_handler == handler_one
+    assert handler_ids_for(event_name) == [handler_one]
 
     :telemetry.execute(event_name, %{}, %{})
 
@@ -817,10 +825,11 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     stop_on_exit(old_reporter)
     assert [{:init, ^old_reporter, 0}] = storage_events(old_state)
 
-    old_handlers = TelemetryMetricsOTLP.handler_ids(old_reporter)
     old_removed_handler = EventHandler.handler_id(name, removed_event)
     old_retained_handler = EventHandler.handler_id(name, retained_event)
-    assert MapSet.new(old_handlers) == MapSet.new([old_removed_handler, old_retained_handler])
+    old_handlers = [old_removed_handler, old_retained_handler]
+    assert handler_ids_for(removed_event) == [old_removed_handler]
+    assert handler_ids_for(retained_event) == [old_retained_handler]
 
     Process.unlink(old_reporter)
     monitor = Process.monitor(old_reporter)
@@ -864,7 +873,7 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     assert handler_ids_for(retained_event) == []
   end
 
-  test "initializes and terminates storage when event-plan compilation fails" do
+  test "rejects an invalid event plan before initializing storage" do
     event_name = unique_event(:reporter_compile_failure)
     name = unique_name(:invalid_reporter)
     state = storage_state(%{observe_event: event_name})
@@ -881,13 +890,11 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
 
     assert Exception.message(exception) =~ "unsupported metric definition"
 
-    assert [{:init, reporter_pid, 0}, {:terminate, terminated_pid}] = storage_events(state)
-    assert terminated_pid == reporter_pid
-
+    assert storage_events(state) == []
     assert handler_ids_for(event_name) == []
   end
 
-  test "terminates initialized storage for non-ArgumentError plan failures" do
+  test "does not initialize storage for non-ArgumentError plan failures" do
     event_name = unique_event(:malformed_definition)
     name = unique_name(:malformed_reporter)
     state = storage_state(%{observe_event: event_name})
@@ -902,9 +909,28 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
                storage: {TestStorage, state}
              )
 
-    assert [{:init, reporter_pid, 0}, {:terminate, terminated_pid}] = storage_events(state)
-    assert terminated_pid == reporter_pid
+    assert storage_events(state) == []
     assert handler_ids_for(event_name) == []
+  end
+
+  test "rejects invalid event names before initializing storage" do
+    valid_event = unique_event(:malformed_event_name)
+    name = unique_name(:malformed_event_reporter)
+    state = storage_state(%{observe_event: valid_event})
+    metric = %{counter("malformed.event", event_name: valid_event) | event_name: "invalid"}
+
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {:event_plan_failed, %ArgumentError{} = exception}} =
+             TelemetryMetricsOTLP.start_link(
+               name: name,
+               metrics: [metric],
+               storage: {TestStorage, state}
+             )
+
+    assert Exception.message(exception) =~ "event_name"
+    assert storage_events(state) == []
+    assert handler_ids_for(valid_event) == []
   end
 
   test "rolls back earlier attachments when a later handler ID collides" do
@@ -917,26 +943,72 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
       counter("rollback.second", event_name: second_event)
     ]
 
-    plan = EventPlan.compile!(metrics, TestStorage, state)
+    plan = EventPlan.compile!(metrics)
     instance_id = make_ref()
-    first_handler = EventHandler.handler_id(instance_id, first_event)
-    colliding_handler = EventHandler.handler_id(instance_id, second_event)
+
+    [{first_event_to_attach, _first_metrics}, {colliding_event, _colliding_metrics}] =
+      Enum.to_list(plan.events)
+
+    first_handler = EventHandler.handler_id(instance_id, first_event_to_attach)
+    colliding_handler = EventHandler.handler_id(instance_id, colliding_event)
 
     :ok =
       :telemetry.attach(
         colliding_handler,
-        second_event,
+        colliding_event,
         &TestStorage.handle_event/4,
         nil
       )
 
     on_exit(fn -> :telemetry.detach(colliding_handler) end)
 
-    assert {:error, {:attach_failed, ^second_event, :already_exists}} =
-             EventHandler.attach(plan.events, instance_id)
+    assert {:error, {:attach_failed, ^colliding_event, :already_exists}} =
+             EventHandler.attach(plan.events, instance_id, TestStorage, state, plan.extract_tags)
+
+    refute first_handler in handler_ids_for(first_event_to_attach)
+    assert colliding_handler in handler_ids_for(colliding_event)
+  end
+
+  test "rolls back earlier attachments when telemetry raises" do
+    first_event = unique_event(:rollback_before_raise)
+    invalid_event = first_event ++ ["not_an_atom"]
+    events = %{first_event => [], invalid_event => []}
+    state = storage_state()
+    instance_id = make_ref()
+    first_handler = EventHandler.handler_id(instance_id, first_event)
+
+    assert Enum.map(events, &elem(&1, 0)) == [first_event, invalid_event]
+
+    assert {:error, {:attach_failed, ^invalid_event, {:error, %ArgumentError{}}}} =
+             EventHandler.attach(events, instance_id, TestStorage, state, nil)
 
     refute first_handler in handler_ids_for(first_event)
-    assert colliding_handler in handler_ids_for(second_event)
+  end
+
+  test "terminates initialized storage when reporter attachment fails" do
+    event_name = unique_event(:reporter_attach_failure)
+    name = unique_name(:reporter_attach_failure)
+    handler_id = EventHandler.handler_id(name, event_name)
+
+    on_init = fn ->
+      :telemetry.attach(handler_id, event_name, &TestStorage.handle_event/4, nil)
+    end
+
+    state = storage_state(%{observe_event: event_name, on_init: on_init})
+    metric = counter("reporter.attach.failure", event_name: event_name)
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {:attach_failed, ^event_name, :already_exists}} =
+             TelemetryMetricsOTLP.start_link(
+               name: name,
+               metrics: [metric],
+               storage: {TestStorage, state}
+             )
+
+    assert [{:init, reporter_pid, 0}, {:terminate, terminated_pid}] = storage_events(state)
+    assert terminated_pid == reporter_pid
+    assert handler_ids_for(event_name) == [handler_id]
   end
 
   defp storage_state(extra \\ %{}) do
@@ -953,8 +1025,10 @@ defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
     end
   end
 
-  defp attach!(%EventPlan{} = plan) do
-    {:ok, handler_ids} = EventHandler.attach(plan.events, make_ref())
+  defp attach!(%EventPlan{} = plan, state) do
+    {:ok, handler_ids} =
+      EventHandler.attach(plan.events, make_ref(), TestStorage, state, plan.extract_tags)
+
     on_exit(fn -> EventHandler.detach(handler_ids) end)
     handler_ids
   end
