@@ -140,7 +140,7 @@ defmodule TelemetryMetricsOTLP.EventPlan do
   end
 
   defp extract_tags_option!(options) when is_list(options) do
-    unless Keyword.keyword?(options) do
+    if not Keyword.keyword?(options) do
       raise ArgumentError,
             "expected event plan options to be a keyword list, got: #{inspect(options)}"
     end

@@ -73,7 +73,7 @@ defmodule TelemetryMetricsOTLP.Storage do
     end
 
     Enum.each(@required_callbacks, fn {function, arity} ->
-      unless function_exported?(module, function, arity) do
+      if not function_exported?(module, function, arity) do
         raise ArgumentError,
               "storage module #{inspect(module)} must implement #{function}/#{arity}"
       end

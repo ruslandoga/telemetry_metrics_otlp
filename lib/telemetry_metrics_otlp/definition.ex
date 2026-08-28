@@ -86,7 +86,7 @@ defmodule TelemetryMetricsOTLP.Definition do
   end
 
   defp bounds!(%Distribution{reporter_options: reporter_options}) do
-    unless Keyword.keyword?(reporter_options) do
+    if not Keyword.keyword?(reporter_options) do
       raise ArgumentError,
             "expected distribution reporter options to be a keyword list, got: #{inspect(reporter_options)}"
     end

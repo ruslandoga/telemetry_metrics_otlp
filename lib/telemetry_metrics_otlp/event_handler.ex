@@ -17,19 +17,21 @@ defmodule TelemetryMetricsOTLP.EventHandler do
   @spec attach([{Telemetry.event_name(), Event.t()}], term()) ::
           {:ok, [handler_id()]} | {:error, term()}
   def attach(events, instance_id) do
-    Enum.reduce_while(events, {:ok, []}, fn {event_name, event}, {:ok, ids} ->
-      handler_id = handler_id(instance_id, event_name)
+    result =
+      Enum.reduce_while(events, {:ok, []}, fn {event_name, event}, {:ok, ids} ->
+        handler_id = handler_id(instance_id, event_name)
 
-      case :telemetry.attach(handler_id, event_name, &__MODULE__.handle_event/4, event) do
-        :ok ->
-          {:cont, {:ok, [handler_id | ids]}}
+        case :telemetry.attach(handler_id, event_name, &__MODULE__.handle_event/4, event) do
+          :ok ->
+            {:cont, {:ok, [handler_id | ids]}}
 
-        {:error, reason} ->
-          detach(ids)
-          {:halt, {:error, {:attach_failed, event_name, reason}}}
-      end
-    end)
-    |> case do
+          {:error, reason} ->
+            detach(ids)
+            {:halt, {:error, {:attach_failed, event_name, reason}}}
+        end
+      end)
+
+    case result do
       {:ok, ids} -> {:ok, Enum.reverse(ids)}
       {:error, _reason} = error -> error
     end
