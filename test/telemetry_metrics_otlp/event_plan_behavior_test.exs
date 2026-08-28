@@ -1,0 +1,1053 @@
+defmodule TelemetryMetricsOTLP.EventPlanBehaviorTest do
+  use ExUnit.Case, async: true
+
+  import Telemetry.Metrics
+
+  alias TelemetryMetricsOTLP.EventHandler
+  alias TelemetryMetricsOTLP.EventPlan
+  alias TelemetryMetricsOTLP.Test.EventPlanStorage, as: TestStorage
+
+  test "groups metrics by event while preserving semantic keys and static metadata" do
+    first_event = unique_event(:first)
+    second_event = unique_event(:second)
+    state = storage_state()
+
+    metrics = [
+      sum("checkout.payload.bytes",
+        event_name: first_event,
+        measurement: :bytes,
+        description: "Payload size",
+        unit: :byte
+      ),
+      counter("checkout.completed.count", event_name: second_event),
+      distribution("checkout.duration",
+        event_name: first_event,
+        measurement: :duration,
+        reporter_options: [buckets: [0, 10, 100]]
+      )
+    ]
+
+    [first_metric, second_metric, third_metric] = metrics
+    plan = EventPlan.compile!(metrics)
+
+    assert EventPlan.size(plan) == 3
+
+    assert %{
+             ^first_event => [
+               {^first_metric,
+                %TelemetryMetricsOTLP.Definition{key: {"checkout.payload.bytes", :sum}}},
+               {^third_metric,
+                %TelemetryMetricsOTLP.Definition{key: {"checkout.duration", :histogram}}}
+             ],
+             ^second_event => [
+               {^second_metric,
+                %TelemetryMetricsOTLP.Definition{
+                  key: {"checkout.completed.count", :counter}
+                }}
+             ]
+           } = plan.events
+
+    assert plan.extract_tags == nil
+
+    assert {:ok,
+            %TelemetryMetricsOTLP.Definition{
+              key: {"checkout.payload.bytes", :sum},
+              kind: :sum,
+              name: "checkout.payload.bytes",
+              description: "Payload size",
+              unit: "By",
+              bounds: []
+            }} = EventPlan.fetch_definition(plan, {"checkout.payload.bytes", :sum})
+
+    assert {:ok,
+            %TelemetryMetricsOTLP.Definition{
+              key: {"checkout.completed.count", :counter},
+              kind: :counter,
+              name: "checkout.completed.count"
+            }} = EventPlan.fetch_definition(plan, {"checkout.completed.count", :counter})
+
+    assert {:ok,
+            %TelemetryMetricsOTLP.Definition{
+              key: {"checkout.duration", :histogram},
+              kind: :histogram,
+              bounds: [0, 10, 100]
+            }} = EventPlan.fetch_definition(plan, {"checkout.duration", :histogram})
+
+    assert :error = EventPlan.fetch_definition(plan, {"missing", :sum})
+
+    handler_ids = attach!(plan, state)
+
+    assert MapSet.new(Enum.map(handler_ids, &elem(&1, 2))) ==
+             MapSet.new([first_event, second_event])
+
+    :telemetry.execute(first_event, %{bytes: 23, duration: 10}, %{})
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:insert_sum, {"checkout.payload.bytes", :sum}, 23, %{}},
+             {:insert_histogram, {"checkout.duration", :histogram}, 10, 1, %{}}
+           ]
+  end
+
+  test "distinguishes metric kinds that share the same normalized name and tags" do
+    event_name = unique_event(:same_name_different_kinds)
+    state = storage_state()
+
+    metrics = [
+      sum("pipeline.batch_size",
+        event_name: event_name,
+        measurement: :batch_size,
+        tags: [:backend_type]
+      ),
+      distribution("pipeline.batch_size",
+        event_name: event_name,
+        measurement: :batch_size,
+        tags: [:backend_type],
+        reporter_options: [buckets: [0, 10, 100]]
+      )
+    ]
+
+    plan = EventPlan.compile!(metrics)
+    assert EventPlan.size(plan) == 2
+    attach!(plan, state)
+
+    metadata = %{backend_type: :clickhouse}
+    :telemetry.execute(event_name, %{batch_size: 10}, metadata)
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:insert_sum, {"pipeline.batch_size", :sum}, 10, %{backend_type: :clickhouse}},
+             {:insert_histogram, {"pipeline.batch_size", :histogram}, 10, 1,
+              %{backend_type: :clickhouse}}
+           ]
+  end
+
+  test "rejects duplicate semantic keys with incompatible units" do
+    metrics = [
+      sum("duplicate.unit", unit: :byte),
+      sum("duplicate.unit", unit: :millisecond)
+    ]
+
+    exception =
+      assert_raise ArgumentError, fn ->
+        EventPlan.compile!(metrics)
+      end
+
+    assert Exception.message(exception) =~ "duplicate.unit"
+    assert Exception.message(exception) =~ "unit"
+  end
+
+  test "rejects duplicate histogram keys with incompatible bounds" do
+    metrics = [
+      distribution("duplicate.histogram", reporter_options: [buckets: [0, 10]]),
+      distribution("duplicate.histogram", reporter_options: [buckets: [0, 20]])
+    ]
+
+    exception =
+      assert_raise ArgumentError, fn ->
+        EventPlan.compile!(metrics)
+      end
+
+    assert Exception.message(exception) =~ "duplicate.histogram"
+    assert Exception.message(exception) =~ "bounds"
+  end
+
+  test "compatible duplicate keys share the canonical longer description" do
+    first_event = unique_event(:compatible_duplicate_first)
+    second_event = unique_event(:compatible_duplicate_second)
+    state = storage_state()
+
+    metrics = [
+      sum("duplicate.compatible",
+        event_name: first_event,
+        measurement: :value,
+        description: "Short"
+      ),
+      sum("duplicate.compatible",
+        event_name: second_event,
+        measurement: :value,
+        description: "A more useful metric description"
+      )
+    ]
+
+    plan = EventPlan.compile!(metrics)
+
+    assert EventPlan.size(plan) == 1
+
+    assert {:ok,
+            %TelemetryMetricsOTLP.Definition{
+              key: {"duplicate.compatible", :sum},
+              description: "A more useful metric description"
+            }} = EventPlan.fetch_definition(plan, {"duplicate.compatible", :sum})
+
+    assert Enum.all?(plan.events, fn {_event_name, [{_metric, definition}]} ->
+             definition.description == "A more useful metric description"
+           end)
+
+    attach!(plan, state)
+
+    :telemetry.execute(first_event, %{value: 2}, %{})
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:insert_sum, {"duplicate.compatible", :sum}, 2, %{}}
+           ]
+
+    :telemetry.execute(second_event, %{value: 3}, %{})
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:insert_sum, {"duplicate.compatible", :sum}, 3, %{}}
+           ]
+  end
+
+  test "records each compatible definition that shares an event and storage key" do
+    event_name = unique_event(:compatible_duplicate_event)
+    state = storage_state()
+
+    metrics = [
+      sum("duplicate.observations", event_name: event_name, measurement: :left),
+      sum("duplicate.observations", event_name: event_name, measurement: :right)
+    ]
+
+    plan = EventPlan.compile!(metrics)
+
+    assert EventPlan.size(plan) == 1
+    attach!(plan, state)
+
+    :telemetry.execute(event_name, %{left: 2, right: 3}, %{})
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:insert_sum, {"duplicate.observations", :sum}, 2, %{}},
+             {:insert_sum, {"duplicate.observations", :sum}, 3, %{}}
+           ]
+  end
+
+  test "chooses duplicate descriptions deterministically when their lengths match" do
+    plan =
+      EventPlan.compile!([
+        sum("duplicate.description", description: "Zulu"),
+        sum("duplicate.description", description: "Able")
+      ])
+
+    assert {:ok, %{description: "Able"}} =
+             EventPlan.fetch_definition(plan, {"duplicate.description", :sum})
+  end
+
+  test "resolves storage once and extracts list-based tags for each metric" do
+    event_name = unique_event(:shared_list_tags)
+    state = storage_state()
+
+    tag_values = fn metadata ->
+      TestStorage.notify(state, {:callback, :tag_values, metadata})
+      metadata
+    end
+
+    metrics = [
+      sum("shared.left",
+        event_name: event_name,
+        measurement: :left,
+        tags: [:route],
+        tag_values: tag_values
+      ),
+      last_value("shared.right",
+        event_name: event_name,
+        measurement: :right,
+        tags: [:route],
+        tag_values: tag_values
+      )
+    ]
+
+    plan = EventPlan.compile!(metrics)
+    attach!(plan, state)
+
+    metadata = %{route: "/orders", ignored: :value}
+    :telemetry.execute(event_name, %{left: 7, right: 2.5}, metadata)
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:callback, :tag_values, metadata},
+             {:insert_sum, {"shared.left", :sum}, 7, %{route: "/orders"}},
+             {:callback, :tag_values, metadata},
+             {:insert_gauge, {"shared.right", :gauge}, 2.5, %{route: "/orders"}}
+           ]
+  end
+
+  test "rejects an invalid reporter-level tag extractor" do
+    assert_raise ArgumentError, ~r/expected extract_tags/, fn ->
+      EventPlan.compile!([], fn _metadata -> %{} end)
+    end
+  end
+
+  test "extracts function-valued tags for each metric" do
+    event_name = unique_event(:shared_function_tags)
+    state = storage_state()
+
+    tags = fn metadata ->
+      TestStorage.notify(state, {:callback, :function_tags, metadata})
+      %{tenant: metadata.tenant}
+    end
+
+    metrics = [
+      counter("function_tags.count", event_name: event_name, tags: tags),
+      sum("function_tags.total", event_name: event_name, measurement: :amount, tags: tags)
+    ]
+
+    metrics
+    |> EventPlan.compile!()
+    |> attach!(state)
+
+    metadata = %{tenant: "acme", ignored: true}
+    :telemetry.execute(event_name, %{amount: 11}, metadata)
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:callback, :function_tags, metadata},
+             {:insert_counter, {"function_tags.count", :counter}, %{tenant: "acme"}},
+             {:callback, :function_tags, metadata},
+             {:insert_sum, {"function_tags.total", :sum}, 11, %{tenant: "acme"}}
+           ]
+  end
+
+  test "custom tag extraction receives each metric definition and metadata" do
+    event_name = unique_event(:custom_tags)
+    state = storage_state()
+
+    metrics = [
+      counter("custom.first", event_name: event_name),
+      sum("custom.second", event_name: event_name, measurement: :amount)
+    ]
+
+    extract_tags = fn metric, metadata ->
+      TestStorage.notify(state, {:callback, :custom_tags, metric.name, metadata})
+      %{metric: List.last(metric.name), tenant: metadata.tenant}
+    end
+
+    metrics
+    |> EventPlan.compile!(extract_tags)
+    |> attach!(state)
+
+    metadata = %{tenant: "globex"}
+    :telemetry.execute(event_name, %{amount: 19}, metadata)
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:callback, :custom_tags, [:custom, :first], metadata},
+             {:insert_counter, {"custom.first", :counter}, %{metric: :first, tenant: "globex"}},
+             {:callback, :custom_tags, [:custom, :second], metadata},
+             {:insert_sum, {"custom.second", :sum}, 19, %{metric: :second, tenant: "globex"}}
+           ]
+  end
+
+  test "invokes keep and measurement callbacks with documented argument order" do
+    event_name = unique_event(:keep_order)
+    state = storage_state()
+
+    keep_one = fn metadata ->
+      TestStorage.notify(state, {:callback, :keep_one, metadata})
+      metadata.accept
+    end
+
+    measurement_one = fn measurements ->
+      TestStorage.notify(state, {:callback, :measurement_one, measurements})
+      measurements.left
+    end
+
+    keep_two = fn metadata, measurements ->
+      TestStorage.notify(state, {:callback, :keep_two, metadata, measurements})
+      metadata.accept and measurements.right > 0
+    end
+
+    measurement_two = fn measurements, metadata ->
+      TestStorage.notify(state, {:callback, :measurement_two, measurements, metadata})
+      measurements.right * metadata.multiplier
+    end
+
+    reject = fn metadata ->
+      TestStorage.notify(state, {:callback, :keep_false, metadata})
+      false
+    end
+
+    skipped_measurement = fn _measurements ->
+      TestStorage.notify(state, {:callback, :unexpected_measurement})
+      raise "measurement must not run after keep returns false"
+    end
+
+    metrics = [
+      sum("keep.one", event_name: event_name, measurement: measurement_one, keep: keep_one),
+      last_value("keep.two",
+        event_name: event_name,
+        measurement: measurement_two,
+        keep: keep_two
+      ),
+      sum("keep.skipped",
+        event_name: event_name,
+        measurement: skipped_measurement,
+        keep: reject
+      )
+    ]
+
+    metrics
+    |> EventPlan.compile!()
+    |> attach!(state)
+
+    measurements = %{left: 12, right: 4}
+    metadata = %{accept: true, multiplier: 3}
+    :telemetry.execute(event_name, measurements, metadata)
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:callback, :keep_one, metadata},
+             {:callback, :measurement_one, measurements},
+             {:insert_sum, {"keep.one", :sum}, 12, %{}},
+             {:callback, :keep_two, metadata, measurements},
+             {:callback, :measurement_two, measurements, metadata},
+             {:insert_gauge, {"keep.two", :gauge}, 12, %{}},
+             {:callback, :keep_false, metadata}
+           ]
+  end
+
+  test "runs keep and measurement validation before per-metric tag extraction" do
+    event_name = unique_event(:lazy_shared_tags)
+    state = storage_state()
+
+    tag_values = fn metadata ->
+      TestStorage.notify(state, {:callback, :tag_values, metadata})
+      metadata
+    end
+
+    metrics = [
+      sum("lazy.filtered",
+        event_name: event_name,
+        measurement: fn _ -> raise "filtered measurement must not run" end,
+        keep: fn metadata ->
+          TestStorage.notify(state, {:callback, :keep, metadata})
+          false
+        end,
+        tags: [:tenant],
+        tag_values: tag_values
+      ),
+      sum("lazy.missing",
+        event_name: event_name,
+        measurement: :missing,
+        tags: [:tenant],
+        tag_values: tag_values
+      )
+    ]
+
+    metrics
+    |> EventPlan.compile!()
+    |> attach!(state)
+
+    metadata = %{tenant: "umbrella"}
+    :telemetry.execute(event_name, %{}, metadata)
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:callback, :keep, metadata},
+             {:record_error, {"lazy.missing", :sum}, {:measurement, :missing}}
+           ]
+  end
+
+  test "supports key, one-arity, and two-arity measurement extraction" do
+    event_name = unique_event(:measurement_variants)
+    state = storage_state()
+
+    one_arity = fn measurements -> measurements.base / 2 end
+    two_arity = fn measurements, metadata -> measurements.base * metadata.factor end
+
+    metrics = [
+      sum("measurement.key", event_name: event_name, measurement: :direct),
+      last_value("measurement.one", event_name: event_name, measurement: one_arity),
+      sum("measurement.two", event_name: event_name, measurement: two_arity)
+    ]
+
+    metrics
+    |> EventPlan.compile!()
+    |> attach!(state)
+
+    :telemetry.execute(event_name, %{direct: -9, base: 7}, %{factor: 4})
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:insert_sum, {"measurement.key", :sum}, -9, %{}},
+             {:insert_gauge, {"measurement.one", :gauge}, 3.5, %{}},
+             {:insert_sum, {"measurement.two", :sum}, 28, %{}}
+           ]
+  end
+
+  test "counter paths ignore measurements while still passing measurements to a two-arity keep" do
+    event_name = unique_event(:counter_bypass)
+    state = storage_state()
+
+    ignored_measurement = fn _measurements, _metadata ->
+      TestStorage.notify(state, {:callback, :unexpected_counter_measurement})
+      raise "counter measurement must be ignored"
+    end
+
+    keep = fn metadata, measurements ->
+      TestStorage.notify(state, {:callback, :counter_keep, metadata, measurements})
+      metadata.keep
+    end
+
+    metrics = [
+      counter("counter.fast", event_name: event_name, measurement: ignored_measurement),
+      counter("counter.kept",
+        event_name: event_name,
+        measurement: ignored_measurement,
+        keep: keep
+      )
+    ]
+
+    metrics
+    |> EventPlan.compile!()
+    |> attach!(state)
+
+    measurements = %{anything: :malformed}
+    metadata = %{keep: true}
+    :telemetry.execute(event_name, measurements, metadata)
+
+    assert storage_events(state) == [
+             {:resolve, self()},
+             {:insert_counter, {"counter.fast", :counter}, %{}},
+             {:callback, :counter_keep, metadata, measurements},
+             {:insert_counter, {"counter.kept", :counter}, %{}}
+           ]
+  end
+
+  test "preserves integer and floating-point measurement terms without coercion" do
+    event_name = unique_event(:numeric_preservation)
+    state = storage_state()
+
+    [sum("numeric.value", event_name: event_name, measurement: :value)]
+    |> EventPlan.compile!()
+    |> attach!(state)
+
+    values = [-1_208_925_819_614_629_174_706_176, -3.75, 0, 0.0]
+
+    for value <- values do
+      :telemetry.execute(event_name, %{value: value}, %{})
+
+      assert [
+               {:resolve, _pid},
+               {:insert_sum, {"numeric.value", :sum}, stored, %{}}
+             ] = storage_events(state)
+
+      assert stored === value
+    end
+  end
+
+  test "records malformed measurements and isolates raised, thrown, and exited callbacks" do
+    event_name = unique_event(:measurement_failures)
+    state = storage_state()
+
+    metrics = [
+      sum("failure.missing", event_name: event_name, measurement: :missing),
+      sum("failure.nil", event_name: event_name, measurement: :nil_value),
+      last_value("failure.non_numeric", event_name: event_name, measurement: :text),
+      sum("failure.raise",
+        event_name: event_name,
+        measurement: fn _ -> raise "measurement raised" end
+      ),
+      sum("failure.throw",
+        event_name: event_name,
+        measurement: fn _ -> throw(:measurement_thrown) end
+      ),
+      sum("failure.exit",
+        event_name: event_name,
+        measurement: fn _ -> exit(:measurement_exited) end
+      ),
+      sum("failure.sibling", event_name: event_name, measurement: :good)
+    ]
+
+    plan = EventPlan.compile!(metrics)
+    [handler_id] = attach!(plan, state)
+
+    :telemetry.execute(event_name, %{nil_value: nil, text: "bad", good: 41}, %{})
+
+    assert [
+             {:resolve, _pid},
+             {:record_error, {"failure.missing", :sum}, {:measurement, :missing}},
+             {:record_error, {"failure.nil", :sum}, {:measurement, nil}},
+             {:record_error, {"failure.non_numeric", :gauge}, {:measurement, :not_number}},
+             {:record_error, {"failure.raise", :sum},
+              {:measurement, {:error, %RuntimeError{message: "measurement raised"}}}},
+             {:record_error, {"failure.throw", :sum},
+              {:measurement, {:throw, :measurement_thrown}}},
+             {:record_error, {"failure.exit", :sum},
+              {:measurement, {:exit, :measurement_exited}}},
+             {:insert_sum, {"failure.sibling", :sum}, 41, %{}}
+           ] = storage_events(state)
+
+    assert handler_id in handler_ids_for(event_name)
+
+    :telemetry.execute(event_name, %{nil_value: nil, text: :bad, good: 42}, %{})
+    assert {:insert_sum, {"failure.sibling", :sum}, 42, %{}} in storage_events(state)
+  end
+
+  test "records invalid keep and tag callbacks without suppressing sibling metrics" do
+    event_name = unique_event(:keep_and_tag_failures)
+    state = storage_state()
+
+    shared_bad_tags = fn metadata ->
+      TestStorage.notify(state, {:callback, :shared_bad_tags, metadata})
+      raise "tag extraction raised"
+    end
+
+    invalid_tags = fn metadata ->
+      TestStorage.notify(state, {:callback, :invalid_tags, metadata})
+      [:not, :a, :map]
+    end
+
+    metrics = [
+      sum("callback.invalid_keep",
+        event_name: event_name,
+        measurement: :value,
+        keep: fn _ -> :yes end
+      ),
+      sum("callback.raised_keep",
+        event_name: event_name,
+        measurement: :value,
+        keep: fn _, _ -> raise "keep raised" end
+      ),
+      sum("callback.bad_tags_one",
+        event_name: event_name,
+        measurement: :value,
+        tags: shared_bad_tags
+      ),
+      counter("callback.bad_tags_two", event_name: event_name, tags: shared_bad_tags),
+      sum("callback.invalid_tags",
+        event_name: event_name,
+        measurement: :value,
+        tags: invalid_tags
+      ),
+      sum("callback.good_sibling", event_name: event_name, measurement: :value)
+    ]
+
+    metrics
+    |> EventPlan.compile!()
+    |> attach!(state)
+
+    metadata = %{tenant: "initech"}
+    :telemetry.execute(event_name, %{value: 5}, metadata)
+
+    assert [
+             {:resolve, _pid},
+             {:record_error, {"callback.invalid_keep", :sum}, {:keep, :invalid_return}},
+             {:record_error, {"callback.raised_keep", :sum},
+              {:keep, {:error, %RuntimeError{message: "keep raised"}}}},
+             {:callback, :shared_bad_tags, ^metadata},
+             {:record_error, {"callback.bad_tags_one", :sum},
+              {:tags, {:error, %RuntimeError{message: "tag extraction raised"}}}},
+             {:callback, :shared_bad_tags, ^metadata},
+             {:record_error, {"callback.bad_tags_two", :counter},
+              {:tags, {:error, %RuntimeError{message: "tag extraction raised"}}}},
+             {:callback, :invalid_tags, ^metadata},
+             {:record_error, {"callback.invalid_tags", :sum}, {:tags, :invalid_return}},
+             {:insert_sum, {"callback.good_sibling", :sum}, 5, %{}}
+           ] = storage_events(state)
+  end
+
+  test "isolates storage failures and failures in the optional error recorder" do
+    event_name = unique_event(:storage_failures)
+
+    state =
+      storage_state(%{
+        failures: %{
+          {:sum, {"storage.sum", :sum}} => {:return, {:error, :busy}},
+          {:gauge, {"storage.gauge", :gauge}} => {:raise, "gauge insert raised"},
+          {:counter, {"storage.counter", :counter}} => {:throw, :counter_insert_thrown},
+          :record_error => {:raise, "diagnostics unavailable"}
+        }
+      })
+
+    metrics = [
+      sum("storage.sum", event_name: event_name, measurement: :value),
+      last_value("storage.gauge", event_name: event_name, measurement: :value),
+      counter("storage.counter", event_name: event_name),
+      sum("storage.sibling", event_name: event_name, measurement: :value)
+    ]
+
+    plan = EventPlan.compile!(metrics)
+    [handler_id] = attach!(plan, state)
+
+    :telemetry.execute(event_name, %{value: 8}, %{})
+
+    assert [
+             {:resolve, _pid},
+             {:insert_sum, {"storage.sum", :sum}, 8, %{}},
+             {:record_error, {"storage.sum", :sum}, {:storage, :busy}},
+             {:insert_gauge, {"storage.gauge", :gauge}, 8, %{}},
+             {:record_error, {"storage.gauge", :gauge},
+              {:storage, {:error, %RuntimeError{message: "gauge insert raised"}}}},
+             {:insert_counter, {"storage.counter", :counter}, %{}},
+             {:record_error, {"storage.counter", :counter},
+              {:storage, {:throw, :counter_insert_thrown}}},
+             {:insert_sum, {"storage.sibling", :sum}, 8, %{}}
+           ] = storage_events(state)
+
+    assert handler_id in handler_ids_for(event_name)
+  end
+
+  test "uses inclusive explicit histogram bounds and an overflow bucket" do
+    event_name = unique_event(:histogram_boundaries)
+    state = storage_state()
+
+    [
+      distribution("histogram.value",
+        event_name: event_name,
+        measurement: :value,
+        reporter_options: [buckets: [-1, 0, 2.5]]
+      )
+    ]
+    |> EventPlan.compile!()
+    |> attach!(state)
+
+    observations = [{-2, 0}, {-1, 0}, {0, 1}, {2.5, 2}, {2.500_001, 3}]
+
+    for {value, expected_bucket} <- observations do
+      :telemetry.execute(event_name, %{value: value}, %{})
+
+      assert [
+               {:resolve, _pid},
+               {:insert_histogram, {"histogram.value", :histogram}, stored, ^expected_bucket, %{}}
+             ] = storage_events(state)
+
+      assert stored === value
+    end
+  end
+
+  test "supports multiple reporter instances, detaches on stop, and restarts cleanly" do
+    event_name = unique_event(:reporter_lifecycle)
+    name_one = unique_name(:reporter_one)
+    name_two = unique_name(:reporter_two)
+    metric = counter("reporter.lifecycle.count", event_name: event_name)
+    state_one = storage_state(%{observe_event: event_name})
+    state_two = storage_state(%{observe_event: event_name})
+
+    {:ok, reporter_one} =
+      TelemetryMetricsOTLP.start_link(
+        name: name_one,
+        metrics: [metric],
+        storage: {TestStorage, state_one}
+      )
+
+    stop_on_exit(reporter_one)
+    assert [{:init, ^reporter_one, 0}] = storage_events(state_one)
+
+    {:ok, reporter_two} =
+      TelemetryMetricsOTLP.start_link(
+        name: name_two,
+        metrics: [metric],
+        storage: {TestStorage, state_two}
+      )
+
+    stop_on_exit(reporter_two)
+    assert [{:init, ^reporter_two, 1}] = storage_events(state_two)
+
+    handler_one = EventHandler.handler_id(name_one, event_name)
+    handler_two = EventHandler.handler_id(name_two, event_name)
+    refute handler_one == handler_two
+    assert MapSet.new(handler_ids_for(event_name)) == MapSet.new([handler_one, handler_two])
+
+    :telemetry.execute(event_name, %{}, %{})
+
+    assert storage_events(state_one) == [
+             {:resolve, self()},
+             {:insert_counter, {"reporter.lifecycle.count", :counter}, %{}}
+           ]
+
+    assert storage_events(state_two) == [
+             {:resolve, self()},
+             {:insert_counter, {"reporter.lifecycle.count", :counter}, %{}}
+           ]
+
+    :ok = GenServer.stop(reporter_one)
+    assert [{:terminate, ^reporter_one}] = storage_events(state_one)
+    assert handler_ids_for(event_name) == [handler_two]
+
+    :telemetry.execute(event_name, %{}, %{})
+    assert storage_events(state_one) == []
+
+    assert storage_events(state_two) == [
+             {:resolve, self()},
+             {:insert_counter, {"reporter.lifecycle.count", :counter}, %{}}
+           ]
+
+    :ok = GenServer.stop(reporter_two)
+    assert [{:terminate, ^reporter_two}] = storage_events(state_two)
+    assert handler_ids_for(event_name) == []
+
+    restarted_state = storage_state(%{observe_event: event_name})
+
+    {:ok, restarted} =
+      TelemetryMetricsOTLP.start_link(
+        name: name_one,
+        metrics: [metric],
+        storage: {TestStorage, restarted_state}
+      )
+
+    stop_on_exit(restarted)
+    assert [{:init, ^restarted, 0}] = storage_events(restarted_state)
+    assert handler_ids_for(event_name) == [handler_one]
+
+    :telemetry.execute(event_name, %{}, %{})
+
+    assert storage_events(restarted_state) == [
+             {:resolve, self()},
+             {:insert_counter, {"reporter.lifecycle.count", :counter}, %{}}
+           ]
+
+    :ok = GenServer.stop(restarted)
+    assert [{:terminate, ^restarted}] = storage_events(restarted_state)
+    assert handler_ids_for(event_name) == []
+  end
+
+  test "restart after an untrappable kill removes stale handlers for deleted events" do
+    removed_event = unique_event(:removed_after_kill)
+    retained_event = unique_event(:retained_after_kill)
+    name = unique_name(:killed_reporter)
+    old_state = storage_state(%{observe_event: retained_event})
+
+    old_metrics = [
+      counter("restart.removed.count", event_name: removed_event),
+      counter("restart.retained.count", event_name: retained_event)
+    ]
+
+    {:ok, old_reporter} =
+      TelemetryMetricsOTLP.start_link(
+        name: name,
+        metrics: old_metrics,
+        storage: {TestStorage, old_state}
+      )
+
+    stop_on_exit(old_reporter)
+    assert [{:init, ^old_reporter, 0}] = storage_events(old_state)
+
+    old_removed_handler = EventHandler.handler_id(name, removed_event)
+    old_retained_handler = EventHandler.handler_id(name, retained_event)
+    old_handlers = [old_removed_handler, old_retained_handler]
+    assert handler_ids_for(removed_event) == [old_removed_handler]
+    assert handler_ids_for(retained_event) == [old_retained_handler]
+
+    Process.unlink(old_reporter)
+    monitor = Process.monitor(old_reporter)
+    Process.exit(old_reporter, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^old_reporter, :killed}
+
+    assert Enum.sort(handler_ids_for(removed_event) ++ handler_ids_for(retained_event)) ==
+             Enum.sort(old_handlers)
+
+    assert storage_events(old_state) == []
+
+    restarted_state = storage_state(%{observe_event: retained_event})
+    retained_metric = counter("restart.retained.count", event_name: retained_event)
+
+    {:ok, restarted} =
+      TelemetryMetricsOTLP.start_link(
+        name: name,
+        metrics: [retained_metric],
+        storage: {TestStorage, restarted_state}
+      )
+
+    stop_on_exit(restarted)
+    assert [{:init, ^restarted, 0}] = storage_events(restarted_state)
+    assert handler_ids_for(removed_event) == []
+    assert handler_ids_for(retained_event) == [old_retained_handler]
+
+    :telemetry.execute(removed_event, %{}, %{})
+    assert storage_events(old_state) == []
+    assert storage_events(restarted_state) == []
+
+    :telemetry.execute(retained_event, %{}, %{})
+    assert storage_events(old_state) == []
+
+    assert storage_events(restarted_state) == [
+             {:resolve, self()},
+             {:insert_counter, {"restart.retained.count", :counter}, %{}}
+           ]
+
+    :ok = GenServer.stop(restarted)
+    assert [{:terminate, ^restarted}] = storage_events(restarted_state)
+    assert handler_ids_for(retained_event) == []
+  end
+
+  test "rejects an invalid event plan before initializing storage" do
+    event_name = unique_event(:reporter_compile_failure)
+    name = unique_name(:invalid_reporter)
+    state = storage_state(%{observe_event: event_name})
+    metric = summary("unsupported.summary", event_name: event_name)
+
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {:event_plan_failed, %ArgumentError{} = exception}} =
+             TelemetryMetricsOTLP.start_link(
+               name: name,
+               metrics: [metric],
+               storage: {TestStorage, state}
+             )
+
+    assert Exception.message(exception) =~ "unsupported metric definition"
+
+    assert storage_events(state) == []
+    assert handler_ids_for(event_name) == []
+  end
+
+  test "does not initialize storage for non-ArgumentError plan failures" do
+    event_name = unique_event(:malformed_definition)
+    name = unique_name(:malformed_reporter)
+    state = storage_state(%{observe_event: event_name})
+    metric = %{counter("malformed.metric", event_name: event_name) | name: nil}
+
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {:event_plan_failed, %Protocol.UndefinedError{}}} =
+             TelemetryMetricsOTLP.start_link(
+               name: name,
+               metrics: [metric],
+               storage: {TestStorage, state}
+             )
+
+    assert storage_events(state) == []
+    assert handler_ids_for(event_name) == []
+  end
+
+  test "rejects invalid event names before initializing storage" do
+    valid_event = unique_event(:malformed_event_name)
+    name = unique_name(:malformed_event_reporter)
+    state = storage_state(%{observe_event: valid_event})
+    metric = %{counter("malformed.event", event_name: valid_event) | event_name: "invalid"}
+
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {:event_plan_failed, %ArgumentError{} = exception}} =
+             TelemetryMetricsOTLP.start_link(
+               name: name,
+               metrics: [metric],
+               storage: {TestStorage, state}
+             )
+
+    assert Exception.message(exception) =~ "event_name"
+    assert storage_events(state) == []
+    assert handler_ids_for(valid_event) == []
+  end
+
+  test "rolls back earlier attachments when a later handler ID collides" do
+    first_event = unique_event(:rollback_first)
+    second_event = unique_event(:rollback_second)
+    state = storage_state()
+
+    metrics = [
+      counter("rollback.first", event_name: first_event),
+      counter("rollback.second", event_name: second_event)
+    ]
+
+    plan = EventPlan.compile!(metrics)
+    instance_id = make_ref()
+
+    [{first_event_to_attach, _first_metrics}, {colliding_event, _colliding_metrics}] =
+      Enum.to_list(plan.events)
+
+    first_handler = EventHandler.handler_id(instance_id, first_event_to_attach)
+    colliding_handler = EventHandler.handler_id(instance_id, colliding_event)
+
+    :ok =
+      :telemetry.attach(
+        colliding_handler,
+        colliding_event,
+        &TestStorage.handle_event/4,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(colliding_handler) end)
+
+    assert {:error, {:attach_failed, ^colliding_event, :already_exists}} =
+             EventHandler.attach(plan.events, instance_id, TestStorage, state, plan.extract_tags)
+
+    refute first_handler in handler_ids_for(first_event_to_attach)
+    assert colliding_handler in handler_ids_for(colliding_event)
+  end
+
+  test "rolls back earlier attachments when telemetry raises" do
+    first_event = unique_event(:rollback_before_raise)
+    invalid_event = first_event ++ ["not_an_atom"]
+    events = %{first_event => [], invalid_event => []}
+    state = storage_state()
+    instance_id = make_ref()
+    first_handler = EventHandler.handler_id(instance_id, first_event)
+
+    assert Enum.map(events, &elem(&1, 0)) == [first_event, invalid_event]
+
+    assert {:error, {:attach_failed, ^invalid_event, {:error, %ArgumentError{}}}} =
+             EventHandler.attach(events, instance_id, TestStorage, state, nil)
+
+    refute first_handler in handler_ids_for(first_event)
+  end
+
+  test "terminates initialized storage when reporter attachment fails" do
+    event_name = unique_event(:reporter_attach_failure)
+    name = unique_name(:reporter_attach_failure)
+    handler_id = EventHandler.handler_id(name, event_name)
+
+    on_init = fn ->
+      :telemetry.attach(handler_id, event_name, &TestStorage.handle_event/4, nil)
+    end
+
+    state = storage_state(%{observe_event: event_name, on_init: on_init})
+    metric = counter("reporter.attach.failure", event_name: event_name)
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {:attach_failed, ^event_name, :already_exists}} =
+             TelemetryMetricsOTLP.start_link(
+               name: name,
+               metrics: [metric],
+               storage: {TestStorage, state}
+             )
+
+    assert [{:init, reporter_pid, 0}, {:terminate, terminated_pid}] = storage_events(state)
+    assert terminated_pid == reporter_pid
+    assert handler_ids_for(event_name) == [handler_id]
+  end
+
+  defp storage_state(extra \\ %{}) do
+    Map.merge(%{owner: self(), token: make_ref(), failures: %{}}, Map.new(extra))
+  end
+
+  defp storage_events(%{token: token}), do: storage_events(token, [])
+
+  defp storage_events(token, events) do
+    receive do
+      {TestStorage, ^token, event} -> storage_events(token, [event | events])
+    after
+      0 -> Enum.reverse(events)
+    end
+  end
+
+  defp attach!(%EventPlan{} = plan, state) do
+    {:ok, handler_ids} =
+      EventHandler.attach(plan.events, make_ref(), TestStorage, state, plan.extract_tags)
+
+    on_exit(fn -> EventHandler.detach(handler_ids) end)
+    handler_ids
+  end
+
+  defp handler_ids_for(event_name) do
+    event_name
+    |> :telemetry.list_handlers()
+    |> Enum.map(& &1.id)
+  end
+
+  defp stop_on_exit(pid) do
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+  end
+
+  defp unique_event(label), do: [__MODULE__, unique_name(label)]
+
+  defp unique_name(label) do
+    String.to_atom("#{label}_#{System.unique_integer([:positive, :monotonic])}")
+  end
+end
